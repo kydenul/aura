@@ -131,6 +131,8 @@ type LogConfig struct {
 
 // DatabaseConfig 关系型数据库配置。
 type DatabaseConfig struct {
+	Enabled             bool   `yaml:"enabled"`                // 是否启用数据库（关闭则启动期不建连接池）
+	Driver              string `yaml:"driver"`                 // 数据库驱动：mysql | postgres，留空按 mysql 处理
 	DSN                 string `yaml:"dsn"`                    // 数据源名称，如 mysql/postgres 连接串
 	MaxOpenConns        int    `yaml:"max_open_conns"`         // 最大打开连接数
 	MaxIdleConns        int    `yaml:"max_idle_conns"`         // 最大空闲连接数
@@ -139,6 +141,7 @@ type DatabaseConfig struct {
 
 // RedisConfig 缓存连接配置。
 type RedisConfig struct {
+	Enabled          bool   `yaml:"enabled"` // 是否启用 Redis（关闭则启动期不建连接池）
 	Host             string `yaml:"host"`
 	Port             int    `yaml:"port"`
 	Password         string `yaml:"password"`
@@ -178,6 +181,7 @@ func newDefaultConfig() *Config {
 			Format: "text",
 		},
 		Database: DatabaseConfig{
+			Driver:              "mysql",
 			MaxOpenConns:        50,
 			MaxIdleConns:        10,
 			ConnMaxLifetimeSecs: 1800,

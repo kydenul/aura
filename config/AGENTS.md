@@ -4,13 +4,13 @@
 
 ## 文件
 
-| 文件 | 职责 |
-|------|------|
-| `config.go` | 加载入口 `Init` / 读端 `Get` / 多环境路径解析 / `${ENV_VAR}` 展开 / `OnReload` 回调注册 / diff 日志 |
-| `types.go` | `Config` 全量结构体（按业务域分组的嵌套子结构）+ `newDefaultConfig` 默认值 |
-| `watcher.go` | `fsnotify` 目录监听 + 防抖（200ms）触发热更 |
-| `config_test.go` | 单元测试 |
-| `app.yaml.example` | 配置模板（复制为 `app.yaml` 后填值） |
+| 文件               | 职责                                                                                                |
+| ------------------ | --------------------------------------------------------------------------------------------------- |
+| `config.go`        | 加载入口 `Init` / 读端 `Get` / 多环境路径解析 / `${ENV_VAR}` 展开 / `OnReload` 回调注册 / diff 日志 |
+| `types.go`         | `Config` 全量结构体（按业务域分组的嵌套子结构）+ `newDefaultConfig` 默认值                          |
+| `watcher.go`       | `fsnotify` 目录监听 + 防抖（200ms）触发热更                                                         |
+| `config_test.go`   | 单元测试                                                                                            |
+| `app.yaml.example` | 配置模板（复制为 `app.yaml` 后填值）                                                                |
 
 ## 核心机制
 
@@ -34,29 +34,29 @@
 
 ### observability 段速览
 
-| 子段 | 关键字段 | 作用 |
-|------|---------|------|
-| `metrics` | `enabled` / `path` | 是否暴露 Prometheus `/metrics` 及路径 |
+| 子段      | 关键字段                                                                      | 作用                                                          |
+| --------- | ----------------------------------------------------------------------------- | ------------------------------------------------------------- |
+| `metrics` | `enabled` / `path`                                                            | 是否暴露 Prometheus `/metrics` 及路径                         |
 | `tracing` | `enabled` / `exporter`(none\|otlp) / `endpoint` / `insecure` / `sample_ratio` | 链路追踪与 span 上报；`enabled=false` 后日志不再带 `trace_id` |
-| `pprof` | `enabled` | `/debug/pprof` 开关（默认关，排障时临时开） |
-| 顶层 | `admin_addr` | 运维端口，统一承载上述端点（与业务端口隔离） |
+| `pprof`   | `enabled`                                                                     | `/debug/pprof` 开关（默认关，排障时临时开）                   |
+| 顶层      | `admin_addr`                                                                  | 运维端口，统一承载上述端点（与业务端口隔离）                  |
 
 ### server.cors 段速览
 
 HTTP CORS 策略集中在 `server.cors`，给生产显式收敛白名单的位置：
 
-| 字段 | 作用 |
-|------|------|
-| `allowed_origins` | 允许的 Origin 列表，缺省 `["*"]`（仅适合本地开发） |
-| `allowed_methods` | 允许的 HTTP 方法 |
-| `allowed_headers` | 允许的请求头 |
+| 字段                | 作用                                                                                         |
+| ------------------- | -------------------------------------------------------------------------------------------- |
+| `allowed_origins`   | 允许的 Origin 列表，缺省 `["*"]`（仅适合本地开发）                                           |
+| `allowed_methods`   | 允许的 HTTP 方法                                                                             |
+| `allowed_headers`   | 允许的请求头                                                                                 |
 | `allow_credentials` | 是否允许带凭证；`true` 时与 `allowed_origins=["*"]` 同时存在违反 CORS 规范，启动期 fail-fast |
 
 ## 常见入口
 
-| 想做什么 | 改哪里 |
-|---------|-------|
-| 加配置项 | `types.go` 对应子结构加字段（带 `yaml` tag）+ `newDefaultConfig` 给默认值 + 更新 `app.yaml.example` |
-| 加一个配置子域 | `types.go` 新建 `XxxConfig` 结构体 + 挂到 `Config` + 默认值 |
-| 让组件响应热更 | 在组件初始化处 `config.OnReload(func(){ ... config.Get() ... })` 注册回调 |
-| 测试里覆盖配置 | `config.SetForTesting(cfg)` 或 `Init(config.WithPath(...), config.WithWatch(false))` |
+| 想做什么       | 改哪里                                                                                              |
+| -------------- | --------------------------------------------------------------------------------------------------- |
+| 加配置项       | `types.go` 对应子结构加字段（带 `yaml` tag）+ `newDefaultConfig` 给默认值 + 更新 `app.yaml.example` |
+| 加一个配置子域 | `types.go` 新建 `XxxConfig` 结构体 + 挂到 `Config` + 默认值                                         |
+| 让组件响应热更 | 在组件初始化处 `config.OnReload(func(){ ... config.Get() ... })` 注册回调                           |
+| 测试里覆盖配置 | `config.SetForTesting(cfg)` 或 `Init(config.WithPath(...), config.WithWatch(false))`                |

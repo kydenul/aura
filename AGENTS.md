@@ -28,37 +28,37 @@ graph LR
 - **拦截器链顺序**（gRPC，外→内）：`recovery → trace → logging → auth → handler`。`trace` 必须在 `logging` 之前，访问日志才能带上 `trace_id`。HTTP 端中间件链：`otelhttp → X-Trace-Id 响应头 → CORS → 访问日志 → mux`。
 - **失败兜底不泄露细节**：`recovery` 把 panic 内容仅写日志，对外只回固定 `codes.Internal`；CORS 策略来自 `config.Server.CORS`，并在启动期拒绝 `allow_credentials=true && origins=["*"]` 的不合规组合。
 - **链路贯通**：HTTP 入口与 loopback gRPC 调用通过 W3C `traceparent` 落在同一条 trace 上（otelhttp + otelgrpc），`trace_id` 自动注入日志字段。
-- **可观测性三支柱**：日志（`pkg/log`）+ 链路（`pkg/otel` tracing，可选 OTLP 上报）+ 指标（`pkg/otel` metrics，Prometheus）。`/metrics`、`/healthz`、`/readyz`、`/debug/pprof` 统一挂在**独立运维端口 `:9090`**（`internal/admin`），与业务端口隔离；gRPC 侧另注册标准健康检查服务。otelgrpc/otelhttp 自动产出 RED 指标，业务零埋点。
+- **可观测性三支柱**：日志（`pkg/log`）+ 链路（`pkg/otel` tracing，可选 OTLP 上报）+ 指标（`pkg/otel` metrics，Prometheus）。`/metrics`、`/healthz`、`/readyz`、`/debug/pprof` 统一挂在**独立运维端口 `:9090`**（`internal/admin`），与业务端口隔离；gRPC 侧另注册标准健康检查服务。otelgrpc/otelhttp 自动产出 RED 指标，业务零埋点。DB / Redis 启用后 `main` 自动挂 otelgorm / redisotel hook，调用续在请求 trace 上，并通过 PingContext 汇总成 `/readyz` 探针（依赖不可用即 503，恢复自动复就绪）。
 - **配置热更**：`config.Get()` 永远拿最新快照；日志级别等【热更生效】字段改 yaml 立即生效，端口 / JWT / 可观测性等【需重启】字段需重启。`Init` 在进程内幂等，`Stop` 之后即便仍有定时器派发也不会改写配置。
 
 ## 技术栈
 
-| 类别 | 选型 |
-|------|------|
-| 语言 | Go 1.26（`module aura`，纯 Go / `CGO_ENABLED=0`） |
-| RPC | [grpc-go](https://google.golang.org/grpc) + [grpc-gateway v2](https://github.com/grpc-ecosystem/grpc-gateway)（HTTP↔gRPC 反向代理） |
-| 协议 | Protocol Buffers + `google.api.http` annotation |
-| 拦截器 | [go-grpc-middleware/v2](https://github.com/grpc-ecosystem/go-grpc-middleware)（recovery / logging / auth / selector） |
-| HTTP 中间件 | [rs/cors](https://github.com/rs/cors)（CORS）+ [gorilla/handlers](https://github.com/gorilla/handlers)（访问日志） |
-| 鉴权 | JWT（[golang-jwt/jwt v5](https://github.com/golang-jwt/jwt)，HS256） |
-| 日志 | [zap](https://github.com/uber-go/zap)（封装见 `pkg/log`，含 context 链路字段） |
-| 链路追踪 | [OpenTelemetry](https://opentelemetry.io)（otelgrpc / otelhttp + W3C TraceContext，可选 OTLP 上报，封装见 `pkg/otel`） |
-| 指标 | OpenTelemetry Metrics + [Prometheus](https://prometheus.io) 拉取式 exporter + Go runtime 指标（封装见 `pkg/otel`，端点见 `internal/admin`） |
-| 健康检查 / 剖析 | gRPC `grpc.health.v1.Health` + HTTP `/healthz` `/readyz` + `net/http/pprof`（统一挂 `internal/admin` 运维端口） |
-| 配置 | YAML（[yaml.v3](https://gopkg.in/yaml.v3)）+ [fsnotify](https://github.com/fsnotify/fsnotify) 热更（封装见 `config/`） |
+| 类别            | 选型                                                                                                                                        |
+| --------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| 语言            | Go 1.26（`module aura`，纯 Go / `CGO_ENABLED=0`）                                                                                           |
+| RPC             | [grpc-go](https://google.golang.org/grpc) + [grpc-gateway v2](https://github.com/grpc-ecosystem/grpc-gateway)（HTTP↔gRPC 反向代理）         |
+| 协议            | Protocol Buffers + `google.api.http` annotation                                                                                             |
+| 拦截器          | [go-grpc-middleware/v2](https://github.com/grpc-ecosystem/go-grpc-middleware)（recovery / logging / auth / selector）                       |
+| HTTP 中间件     | [rs/cors](https://github.com/rs/cors)（CORS）+ [gorilla/handlers](https://github.com/gorilla/handlers)（访问日志）                          |
+| 鉴权            | JWT（[golang-jwt/jwt v5](https://github.com/golang-jwt/jwt)，HS256）                                                                        |
+| 日志            | [zap](https://github.com/uber-go/zap)（封装见 `pkg/log`，含 context 链路字段）                                                              |
+| 链路追踪        | [OpenTelemetry](https://opentelemetry.io)（otelgrpc / otelhttp + W3C TraceContext，可选 OTLP 上报，封装见 `pkg/otel`）                      |
+| 指标            | OpenTelemetry Metrics + [Prometheus](https://prometheus.io) 拉取式 exporter + Go runtime 指标（封装见 `pkg/otel`，端点见 `internal/admin`） |
+| 健康检查 / 剖析 | gRPC `grpc.health.v1.Health` + HTTP `/healthz` `/readyz` + `net/http/pprof`（统一挂 `internal/admin` 运维端口）                             |
+| 配置            | YAML（[yaml.v3](https://gopkg.in/yaml.v3)）+ [fsnotify](https://github.com/fsnotify/fsnotify) 热更（封装见 `config/`）                      |
 
 ## 顶层目录速查
 
-| 路径 | 作用 | 下钻入口 |
-|------|------|---------|
-| `cmd/server/main.go` | 程序入口：装配配置 / 日志 / 链路 / JWT，同进程起 gRPC + HTTP 两个 server + 优雅关闭 | 直接读源码（约 200 行，已详注） |
-| [`proto/`](proto/AGENTS.md) | Protobuf 协议定义 + HTTP 路由映射（**改接口的源头**） | L2 |
-| [`internal/`](internal/AGENTS.md) | 业务实现：`service/`（gRPC handler）+ `interceptor/`（拦截器 + HTTP 中间件）+ `admin/`（运维/可观测性端点） | L2 |
-| [`pkg/`](pkg/AGENTS.md) | 框架无关可复用组件：`jwt/` / `log/` / `otel/` | L2 |
-| [`config/`](config/AGENTS.md) | 配置加载、多环境解析、热更新 | L2 |
-| `gen/proto/` | `protoc` 生成产物（`*.pb.go` / `*_grpc.pb.go` / `*.pb.gw.go`），**勿手改**，运行 `make proto` 重生成 | — |
-| `scripts/generate.sh` | 一键生成 pb 三件套（被 `make proto` 调用） | 直接读 |
-| `config/app.yaml.example` | 配置模板，复制为 `config/app.yaml` 后填值 | — |
+| 路径                              | 作用                                                                                                        | 下钻入口                        |
+| --------------------------------- | ----------------------------------------------------------------------------------------------------------- | ------------------------------- |
+| `cmd/server/main.go`              | 程序入口：装配配置 / 日志 / 链路 / JWT，同进程起 gRPC + HTTP 两个 server + 优雅关闭                         | 直接读源码（约 200 行，已详注） |
+| [`proto/`](proto/AGENTS.md)       | Protobuf 协议定义 + HTTP 路由映射（**改接口的源头**）                                                       | L2                              |
+| [`internal/`](internal/AGENTS.md) | 业务实现：`service/`（gRPC handler）+ `interceptor/`（拦截器 + HTTP 中间件）+ `admin/`（运维/可观测性端点） | L2                              |
+| [`pkg/`](pkg/AGENTS.md)           | 框架无关可复用组件：`jwt/` / `log/` / `otel/` / `db/` / `redis/`（按需启用）                                  | L2                              |
+| [`config/`](config/AGENTS.md)     | 配置加载、多环境解析、热更新                                                                                | L2                              |
+| `gen/proto/`                      | `protoc` 生成产物（`*.pb.go` / `*_grpc.pb.go` / `*.pb.gw.go`），**勿手改**，运行 `make proto` 重生成        | —                               |
+| `scripts/generate.sh`             | 一键生成 pb 三件套（被 `make proto` 调用）                                                                  | 直接读                          |
+| `config/app.yaml.example`         | 配置模板，复制为 `config/app.yaml` 后填值                                                                   | —                               |
 
 ## 启动方式
 
@@ -81,17 +81,17 @@ make test            # 运行全部单测
 
 ## 常见入口
 
-| 想做什么 | 改哪里 |
-|---------|-------|
-| 加一个 RPC / 改请求响应字段 | [`proto/AGENTS.md`](proto/AGENTS.md) → 改 `user.proto` → `make proto` → 在 `internal/service` 实现 |
-| 改某个接口的业务逻辑 | [`internal/AGENTS.md`](internal/AGENTS.md) → `service/user.go` |
-| 加 / 改拦截器或 HTTP 中间件 | [`internal/AGENTS.md`](internal/AGENTS.md) → `interceptor/` + 在 `cmd/server/main.go` 挂链 |
-| 调鉴权规则 / 免鉴权白名单 | [`internal/AGENTS.md`](internal/AGENTS.md) → `interceptor/auth.go` 的 `authWhitelist` |
-| 复用 JWT / 日志 / 链路能力 | [`pkg/AGENTS.md`](pkg/AGENTS.md) |
-| 加配置项 | [`config/AGENTS.md`](config/AGENTS.md) → `types.go` 加字段 + 默认值 + 更新 `app.yaml.example` |
-| 开关指标 / 链路上报 / pprof | 改 `config` 的 `observability` 段（`metrics` / `tracing.exporter=otlp` / `pprof.enabled`） |
-| 加自定义业务指标 | [`pkg/AGENTS.md`](pkg/AGENTS.md) → 用全局 `MeterProvider` 建 counter/histogram，自动并入 `/metrics` |
-| 接真实 DB / Redis（替换内存实现） | `config` 已留好 `Database` / `Redis` 配置段；在 `internal/service` 注入依赖替换内存 map |
+| 想做什么                          | 改哪里                                                                                              |
+| --------------------------------- | --------------------------------------------------------------------------------------------------- |
+| 加一个 RPC / 改请求响应字段       | [`proto/AGENTS.md`](proto/AGENTS.md) → 改 `user.proto` → `make proto` → 在 `internal/service` 实现  |
+| 改某个接口的业务逻辑              | [`internal/AGENTS.md`](internal/AGENTS.md) → `service/user.go`                                      |
+| 加 / 改拦截器或 HTTP 中间件       | [`internal/AGENTS.md`](internal/AGENTS.md) → `interceptor/` + 在 `cmd/server/main.go` 挂链          |
+| 调鉴权规则 / 免鉴权白名单         | [`internal/AGENTS.md`](internal/AGENTS.md) → `interceptor/auth.go` 的 `authWhitelist`               |
+| 复用 JWT / 日志 / 链路能力        | [`pkg/AGENTS.md`](pkg/AGENTS.md)                                                                    |
+| 加配置项                          | [`config/AGENTS.md`](config/AGENTS.md) → `types.go` 加字段 + 默认值 + 更新 `app.yaml.example`       |
+| 开关指标 / 链路上报 / pprof       | 改 `config` 的 `observability` 段（`metrics` / `tracing.exporter=otlp` / `pprof.enabled`）          |
+| 加自定义业务指标                  | [`pkg/AGENTS.md`](pkg/AGENTS.md) → 用全局 `MeterProvider` 建 counter/histogram，自动并入 `/metrics` |
+| 接真实 DB / Redis（替换内存实现） | `config` 已留好 `Database` / `Redis` 配置段；在 `internal/service` 注入依赖替换内存 map             |
 
 ## 维护守则（写文档的人请看）
 

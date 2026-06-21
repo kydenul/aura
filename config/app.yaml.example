@@ -37,6 +37,11 @@ log:
 
 # ── 数据库 ────────────────────────────────────────────────────────────────────
 database:
+  enabled: false                     # 是否启用数据库（关闭则启动期不建连接池）
+  driver: "mysql"                    # 数据库驱动：mysql | postgres
+  # DSN 按 driver 填写：
+  #   mysql:    user:pass@tcp(host:3306)/db?charset=utf8mb4&parseTime=true&loc=Local
+  #   postgres: host=h user=u password=p dbname=d port=5432 sslmode=disable TimeZone=Asia/Shanghai
   dsn: "${DATABASE_DSN}"
   max_open_conns: 50
   max_idle_conns: 10
@@ -44,6 +49,7 @@ database:
 
 # ── Redis ─────────────────────────────────────────────────────────────────────
 redis:
+  enabled: false                     # 是否启用 Redis（关闭则启动期不建连接池）
   host: "127.0.0.1"
   port: 6379
   password: "${REDIS_PASSWORD}"

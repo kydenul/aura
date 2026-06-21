@@ -46,6 +46,8 @@ Single Go process exposes both gRPC (`:5568`) and HTTP/REST (`:8080`) for the **
 - **Trace continuity.** HTTP entry and loopback gRPC end up in the same trace via W3C `traceparent` (otelhttp + otelgrpc). `trace_id` is injected into logs by `interceptor/trace.go` and read by `log.InfoContext`.
 - **`InitMetrics` must run before** any otelgrpc/otelhttp instrumentation is created — it sets the global `MeterProvider`, after which RED metrics flow with zero business-side instrumentation.
 - **`config.Init` is idempotent and `Stop`-safe.** 进程内多次调用只首次生效；`Stop` 之后即便仍有 fsnotify 定时器派发，`doReload` 也会被 `watchClosed` 守卫短路，不再修改全局配置指针。
+- **DB / Redis 按需启用 + 自动接 OTel.** `config.{Database,Redis}.Enabled=true` 时 `main` 调 `pkg/db`、`pkg/redis` 的 `Init` 建连接池；`tracing.enabled=true` 时再调 `InstrumentTracing()` 挂 otelgorm / redisotel hook —— 业务侧务必用 `db.Get().WithContext(ctx)` 才能让 SQL span 续在请求 trace 上。两者同时也是 `/readyz` 的就绪依赖（2s PingContext，超时即 503，恢复自动复就绪）。
+- **限流器 Lua 由 NewScript 缓存 + 单调 member.** `pkg/redis.SlidingWindowLimiter` 用 `redis.NewScript` 自动 EVALSHA；ZSet member 由进程内 `atomic.Uint64` 单调序列拼成，根本上避免「同毫秒并发被 ZADD 去重吞计数」的偏紧问题。
 
 ## Config model
 
@@ -57,17 +59,17 @@ Single Go process exposes both gRPC (`:5568`) and HTTP/REST (`:8080`) for the **
 
 ## Where to make changes (cheat sheet)
 
-| Want to... | Go to |
-|---|---|
-| Add/change an RPC or wire format | `proto/user.proto` → `make proto` → implement in `internal/service` |
-| Change business logic for an endpoint | `internal/service/user.go` |
-| Add a gRPC interceptor | New file in `internal/interceptor/` → insert into `ChainUnaryInterceptor` in `cmd/server/main.go` (mind the order rule above) |
-| Add an HTTP middleware | `internal/interceptor/http_middleware.go` → wrap into the handler chain in `cmd/server/main.go` |
-| Tune CORS policy | `config.server.cors` 段（白名单 / 方法 / Headers / Credentials） |
-| Allow-list a method for auth | `authWhitelist` in `internal/interceptor/auth.go` (FullMethod string) |
-| Add a config field | `config/types.go` (+ default in `newDefaultConfig`) + `config/app.yaml.example` |
-| Add a custom business metric | Use the global `MeterProvider` (`otel.GetMeterProvider().Meter(...)`) — it's plumbed into `/metrics` automatically |
-| Toggle metrics/tracing/pprof | yaml `observability.{metrics,tracing,pprof}` — no code change |
+| Want to...                            | Go to                                                                                                                         |
+| ------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| Add/change an RPC or wire format      | `proto/user.proto` → `make proto` → implement in `internal/service`                                                           |
+| Change business logic for an endpoint | `internal/service/user.go`                                                                                                    |
+| Add a gRPC interceptor                | New file in `internal/interceptor/` → insert into `ChainUnaryInterceptor` in `cmd/server/main.go` (mind the order rule above) |
+| Add an HTTP middleware                | `internal/interceptor/http_middleware.go` → wrap into the handler chain in `cmd/server/main.go`                               |
+| Tune CORS policy                      | `config.server.cors` 段（白名单 / 方法 / Headers / Credentials）                                                              |
+| Allow-list a method for auth          | `authWhitelist` in `internal/interceptor/auth.go` (FullMethod string)                                                         |
+| Add a config field                    | `config/types.go` (+ default in `newDefaultConfig`) + `config/app.yaml.example`                                               |
+| Add a custom business metric          | Use the global `MeterProvider` (`otel.GetMeterProvider().Meter(...)`) — it's plumbed into `/metrics` automatically            |
+| Toggle metrics/tracing/pprof          | yaml `observability.{metrics,tracing,pprof}` — no code change                                                                 |
 
 ## Local workflow rules
 

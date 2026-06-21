@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"os"
@@ -16,9 +17,11 @@ import (
 	"aura/internal/admin"
 	"aura/internal/interceptor"
 	"aura/internal/service"
-	authjwt "aura/pkg/jwt"
+	"aura/pkg/db"
+	"aura/pkg/jwt"
 	"aura/pkg/log"
 	"aura/pkg/otel"
+	"aura/pkg/redis"
 
 	"github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
@@ -33,29 +36,26 @@ import (
 // serviceName 作为 OTel 资源属性 service.name，用于链路 / 指标归属标识。
 const serviceName = "aura"
 
-// insecureDevSecret 是 config 模板里附带的本地调试默认密钥，命中时给出警告。
-// 这是公开的占位字符串而非真实凭据，故抑制 gosec G101 误报。
-const insecureDevSecret = "dev-only-insecure-secret-change-me" //nolint:gosec // G101: 公开占位默认值，非真实凭据
-
-// minSecureSecretLen 视为「足够强」的 JWT 密钥最小字节数。HS256 推荐 >=32B（256bit）。
-const minSecureSecretLen = 32
+// readinessProbeTimeout 是 /readyz 单次依赖探测（DB / Redis Ping）的总超时，
+// 取较短值避免探针被慢依赖拖死，超时即视为未就绪。
+const readinessProbeTimeout = 2 * time.Second
 
 func main() {
-	// 加载配置（按 APP_ENV 选择文件，支持热更新）。
+	// ---------- 1. 加载配置 ----------
+	// 按 APP_ENV 选择 yaml 文件并解析；config 内部起 fsnotify 监听，config.Get() 永远拿最新快照（热更）。
 	if err := config.Init(); err != nil {
 		log.Fatalf("failed to load config: %v", err)
 	}
 	defer config.Stop()
 	cfg := config.Get()
 
-	// 初始化统一日志组件（基于 zap），级别/格式来自配置。
+	// ---------- 2. 初始化日志 ----------
+	// 统一日志组件（基于 zap）；OnReload 回调让日志级别改 yaml 后立即生效，无需重启。
 	if err := log.Init(log.Config{Level: cfg.Log.Level, Format: cfg.Log.Format}); err != nil {
 		log.Fatalf("failed to init logger: %v", err)
 	}
-	// 日志级别支持热更：改 yaml 后立即生效，无需重启。
 	config.OnReload(func() {
-		c := config.Get()
-		if err := log.SetLevel(c.Log.Level); err != nil {
+		if err := log.SetLevel(config.Get().Log.Level); err != nil {
 			log.Warnf("热更日志级别失败，保持原级别: %v", err)
 		}
 	})
@@ -64,10 +64,62 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// 初始化可观测性：链路追踪（OTel）+ 指标采集（Prometheus）。
-	// 指标必须先于下面创建 otelgrpc / otelhttp instrumentation，二者会读取全局
-	// MeterProvider 自动产出 gRPC / HTTP 的 RED 指标。
+	// ---------- 3. 装配进程级依赖：可观测性 / JWT / 数据库 / 缓存 ----------
+	// 各组件细节见对应 helper。initObservability 必须先于后面的 server instrumentation 调用；
+	// initInfra 返回的清理函数在进程退出时关闭连接池。
+	metricsHandler := initObservability(ctx, cfg.Observability)
+
+	warnInsecureJWTSecret(cfg.JWT.Secret)
+	jwtMgr, err := jwt.NewManager(jwt.Config{
+		Secret: cfg.JWT.Secret,
+		Issuer: cfg.JWT.Issuer,
+		TTL:    cfg.JWT.TTL(),
+	})
+	if err != nil {
+		log.Fatalf("failed to init jwt manager: %v", err)
+	}
+
+	closeInfra := initInfra(cfg)
+	defer closeInfra()
+
+	// ---------- 4. 启动三个 server（各自独立 goroutine）----------
+	// gRPC（:5568 内部高性能）/ HTTP gateway（:8080 外部 REST，经同进程 loopback 转发到 gRPC）
+	// / admin（:9090 运维，承载 metrics/health/pprof，与业务端口隔离）。
 	obs := cfg.Observability
+	grpcServer := newGRPCServer(jwtMgr)
+	lis, err := net.Listen("tcp", cfg.Server.GRPCAddr)
+	if err != nil {
+		log.Fatalf("failed to listen on %s: %v", cfg.Server.GRPCAddr, err)
+	}
+
+	httpServer, err := newHTTPGatewayServer(ctx, cfg.Server)
+	if err != nil {
+		log.Fatalf("failed to create http gateway server: %v", err)
+	}
+
+	adminServer := admin.NewServer(admin.Options{
+		Addr:              obs.AdminAddr,
+		ReadHeaderTimeout: time.Duration(cfg.Server.ReadHeaderTimeoutSecs) * time.Second,
+		MetricsPath:       obs.Metrics.Path,
+		MetricsHandler:    metricsHandler,
+		EnablePprof:       obs.Pprof.Enabled,
+		ReadinessCheck:    newReadinessCheck(cfg),
+	})
+
+	serveAsync("gRPC server", cfg.Server.GRPCAddr, func() error { return grpcServer.Serve(lis) }, true)
+	serveAsync("HTTP gateway", cfg.Server.HTTPAddr, httpServer.ListenAndServe, true)
+	serveAsync("admin server (metrics/health/pprof)", obs.AdminAddr, adminServer.ListenAndServe, false)
+
+	// ---------- 5. 等待信号并优雅关闭 ----------
+	// 阻塞直到收到 SIGINT / SIGTERM，再按序关闭三个 server 并刷新可观测性缓冲。
+	waitForShutdown(grpcServer, httpServer, adminServer, cfg.Server.ShutdownTimeoutSecs)
+}
+
+// initObservability 按配置装配链路追踪（OTel tracing）与指标采集（Prometheus），
+// 返回 /metrics 的 handler（Metrics 未启用时为 nil）。
+// 必须在创建 otelgrpc / otelhttp instrumentation 之前调用：二者会读取全局
+// MeterProvider / TracerProvider，自动产出 gRPC / HTTP 的 RED 指标与 span。
+func initObservability(ctx context.Context, obs config.ObservabilityConfig) http.Handler {
 	if obs.Tracing.Enabled {
 		if err := otel.InitTracing(ctx, otel.TracingOptions{
 			ServiceName: serviceName,
@@ -80,81 +132,140 @@ func main() {
 		}
 	}
 
-	var metricsHandler http.Handler
 	if obs.Metrics.Enabled {
 		h, err := otel.InitMetrics(serviceName)
 		if err != nil {
 			log.Fatalf("failed to init metrics: %v", err)
 		}
-		metricsHandler = h
+		return h
 	}
+	return nil
+}
 
-	// JWT 管理器：密钥、issuer、有效期全部来自配置文件。
-	// 生产环境请在 yaml 中用 ${JWT_SECRET} 从环境变量注入，切勿使用调试默认值。
-	warnInsecureJWTSecret(cfg.JWT.Secret)
-	jwtManager, err := authjwt.NewManager(authjwt.Config{
-		Secret: cfg.JWT.Secret,
-		Issuer: cfg.JWT.Issuer,
-		TTL:    cfg.JWT.TTL(),
-	})
-	if err != nil {
-		log.Fatalf("failed to init jwt manager: %v", err)
-	}
+// initInfra 按配置装配数据库 / 缓存（框架无关的 pkg 组件，连接失败直接 Fatal），
+// 业务侧通过 db.Get() / redis.Get() 取全局单例。返回的清理函数应由调用方 defer，
+// 在进程退出时关闭连接池。
+func initInfra(cfg *config.Config) func() {
+	var cleanups []func()
 
-	// ---------- 1. 启动 gRPC Server ----------
-	grpcServer := newGRPCServer(jwtManager)
-
-	lis, err := net.Listen("tcp", cfg.Server.GRPCAddr)
-	if err != nil {
-		log.Fatalf("failed to listen on %s: %v", cfg.Server.GRPCAddr, err)
-	}
-
-	go func() {
-		log.Infof("🚀 gRPC server listening on %s", cfg.Server.GRPCAddr)
-		if err := grpcServer.Serve(lis); err != nil {
-			log.Fatalf("grpc server error: %v", err)
+	if cfg.Database.Enabled {
+		if err := db.Init(db.Options{
+			Driver:          cfg.Database.Driver,
+			DSN:             cfg.Database.DSN,
+			MaxOpenConns:    cfg.Database.MaxOpenConns,
+			MaxIdleConns:    cfg.Database.MaxIdleConns,
+			ConnMaxLifetime: time.Duration(cfg.Database.ConnMaxLifetimeSecs) * time.Second,
+		}); err != nil {
+			log.Fatalf("failed to init database: %v", err)
 		}
-	}()
-
-	// ---------- 2. 启动 HTTP Gateway Server ----------
-	// grpc-gateway 的标准做法：起一个 grpc.ClientConn 连到本地的 gRPC server，
-	// 把 HTTP 请求"翻译"成 gRPC 请求后通过这个连接转发过去。
-	// 因为是同进程内 loopback 调用，延迟可以忽略不计。
-	httpServer, err := newHTTPGatewayServer(ctx, cfg.Server)
-	if err != nil {
-		log.Fatalf("failed to create http gateway server: %v", err)
+		cleanups = append(cleanups, func() { _ = db.Close() })
+		log.Info("✅ database connected")
 	}
 
-	go func() {
-		log.Infof("🚀 HTTP gateway listening on %s", cfg.Server.HTTPAddr)
-		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Fatalf("http server error: %v", err)
+	if cfg.Redis.Enabled {
+		if err := redis.Init(redis.Options{
+			Host:         cfg.Redis.Host,
+			Port:         cfg.Redis.Port,
+			Password:     cfg.Redis.Password,
+			DB:           cfg.Redis.DB,
+			PoolSize:     cfg.Redis.PoolSize,
+			MinIdleConns: cfg.Redis.MinIdleConns,
+			DialTimeout:  time.Duration(cfg.Redis.DialTimeoutSecs) * time.Second,
+			ReadTimeout:  time.Duration(cfg.Redis.ReadTimeoutSecs) * time.Second,
+			WriteTimeout: time.Duration(cfg.Redis.WriteTimeoutSecs) * time.Second,
+			MaxRetries:   cfg.Redis.MaxRetries,
+		}); err != nil {
+			log.Fatalf("failed to init redis: %v", err)
 		}
-	}()
+		cleanups = append(cleanups, func() { _ = redis.Get().Close() })
+		log.Info("✅ redis connected")
+	}
 
-	// ---------- 3. 启动运维/可观测性 Server ----------
-	// 独立端口承载 /metrics、/healthz、/readyz、/debug/pprof，与业务端口隔离。
-	adminServer := admin.NewServer(admin.Options{
-		Addr:              obs.AdminAddr,
-		ReadHeaderTimeout: time.Duration(cfg.Server.ReadHeaderTimeoutSecs) * time.Second,
-		MetricsPath:       obs.Metrics.Path,
-		MetricsHandler:    metricsHandler,
-		EnablePprof:       obs.Pprof.Enabled,
-	})
+	// db / redis 接入 OTel：必须在 initInfra 装配完客户端、且 initObservability 已设全局
+	// TracerProvider / MeterProvider 之后调用，hook 注册才有意义。未启用对应依赖时是 no-op。
+	instrumentInfraWithOTel(cfg)
 
-	go func() {
-		log.Infof("🚀 admin server listening on %s (metrics/health/pprof)", obs.AdminAddr)
-		if err := adminServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Errorf("admin server error: %v", err)
+	return func() {
+		// LIFO：后建先关，避免后续依赖（如某组件持有前者的句柄）顺序错乱。
+		for i := len(cleanups) - 1; i >= 0; i-- {
+			cleanups[i]()
 		}
-	}()
+	}
+}
 
-	// ---------- 4. 优雅关闭 ----------
-	waitForShutdown(grpcServer, httpServer, adminServer, cfg.Server.ShutdownTimeoutSecs)
+// newReadinessCheck 组装 /readyz 的就绪探针：对已启用的依赖（DB / Redis）逐个 Ping，
+// 任一不可用即返回 error，让 /readyz 回 503，供 K8s / 负载均衡摘流；依赖恢复后自动复就绪。
+// 当 DB 与 Redis 均未启用时返回 nil（admin 侧据此视为恒就绪）。
+func newReadinessCheck(cfg *config.Config) func() error {
+	if !cfg.Database.Enabled && !cfg.Redis.Enabled {
+		return nil
+	}
+	return func() error {
+		ctx, cancel := context.WithTimeout(context.Background(), readinessProbeTimeout)
+		defer cancel()
+
+		if cfg.Database.Enabled {
+			sqlDB := db.SQLDB()
+			if sqlDB == nil {
+				return errors.New("database not initialized")
+			}
+			if err := sqlDB.PingContext(ctx); err != nil {
+				return fmt.Errorf("database: %w", err)
+			}
+		}
+
+		if cfg.Redis.Enabled {
+			client := redis.Get()
+			if client == nil {
+				return errors.New("redis not initialized")
+			}
+			if err := client.Ping(ctx); err != nil {
+				return fmt.Errorf("redis: %w", err)
+			}
+		}
+		return nil
+	}
+}
+
+// instrumentInfraWithOTel 在 db / redis 已 Init、OTel 已设全局 Provider 之后挂 hook：
+//   - tracing 启用 → 给两者各挂 trace 插件，让 SQL / Redis 调用续在请求 trace 上；
+//   - metrics 启用 → 给 redis 挂 metrics hook（otelgorm 默认会上报 DBStats 指标）。
+//
+// 顺序：必须在 initInfra 之后（globalDB / globalClient 已就绪），且 initObservability
+// 之后（TracerProvider / MeterProvider 已绑定到 OTel 全局），否则 hook 会挂到 noop。
+func instrumentInfraWithOTel(cfg *config.Config) {
+	if cfg.Observability.Tracing.Enabled {
+		if cfg.Database.Enabled {
+			db.InstrumentTracing()
+		}
+		if cfg.Redis.Enabled {
+			redis.InstrumentTracing()
+		}
+	}
+	if cfg.Observability.Metrics.Enabled && cfg.Redis.Enabled {
+		redis.InstrumentMetrics()
+	}
+}
+
+// serveAsync 在独立 goroutine 启动一个 server，统一日志与错误处理。
+// 优雅关闭返回的 nil / http.ErrServerClosed 视为正常退出；其余错误：
+// fatal=true 直接 log.Fatalf 终止进程（核心业务端口），否则仅 Errorf（运维端口）。
+func serveAsync(name, addr string, serve func() error, fatal bool) {
+	go func() {
+		log.Infof("🚀 %s listening on %s", name, addr)
+		err := serve()
+		if err == nil || errors.Is(err, http.ErrServerClosed) {
+			return
+		}
+		if fatal {
+			log.Fatalf("%s error: %v", name, err)
+		}
+		log.Errorf("%s error: %v", name, err)
+	}()
 }
 
 // newGRPCServer 创建 gRPC server，挂载业务 service 和拦截器链
-func newGRPCServer(jwtManager *authjwt.Manager) *grpc.Server {
+func newGRPCServer(jwtManager *jwt.Manager) *grpc.Server {
 	server := grpc.NewServer(
 		// otelgrpc StatsHandler：依据 W3C traceparent 解析/生成 SpanContext 并注入 context，
 		// 同时产出 gRPC RED 指标（依赖全局 MeterProvider）。OpenTelemetry 官方 instrumentation。
@@ -257,9 +368,19 @@ func corsOptionsFrom(c config.CORSConfig) interceptor.CORSOptions {
 //   - 长度过短（HS256 推荐 >=32B，OWASP 也建议至少 256bit 熵）；
 //   - 未注入（${JWT_SECRET} 未展开导致空串）—— 由 NewManager 报错，不在此处理。
 func warnInsecureJWTSecret(secret string) {
+	const (
+		// insecureDevSecret 是 config 模板里附带的本地调试默认密钥，命中时给出警告。
+		// 这是公开的占位字符串而非真实凭据，故抑制 gosec G101 误报。
+		insecureDevSecret = "dev-only-insecure-secret-change-me" //nolint:gosec // G101: 公开占位默认值，非真实凭据
+
+		// minSecureSecretLen 视为「足够强」的 JWT 密钥最小字节数。HS256 推荐 >=32B（256bit）。
+		minSecureSecretLen = 32
+	)
+
 	switch {
 	case secret == insecureDevSecret:
 		log.Warn("⚠️  正在使用 config 中的本地调试 JWT 密钥，切勿用于生产")
+
 	case len(secret) < minSecureSecretLen:
 		log.Warnf("⚠️  JWT 密钥长度仅 %d 字节（建议 >= %d），生产环境请使用强随机密钥",
 			len(secret), minSecureSecretLen)

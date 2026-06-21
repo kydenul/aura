@@ -1,6 +1,7 @@
 # grpc-gateway-demo
 
 原生 grpc-go 服务，同进程内同时暴露：
+
 - **gRPC 端口 `:5568`**：供内部服务间高性能调用
 - **HTTP REST 端口 `:8080`**：供外部第三方程序 / 前端 / Postman 调用
 
@@ -50,6 +51,7 @@ go run ./cmd/server
 ```
 
 看到这两行说明启动成功：
+
 ```
 🚀 gRPC server listening on :5568
 🚀 HTTP gateway listening on :8080
@@ -58,6 +60,7 @@ go run ./cmd/server
 ## 接口测试
 
 ### 创建用户（HTTP REST）
+
 ```bash
 curl -X POST http://localhost:8080/v1/users \
   -H "Authorization: Bearer demo-token-123" \
@@ -66,18 +69,21 @@ curl -X POST http://localhost:8080/v1/users \
 ```
 
 ### 查询用户
+
 ```bash
 curl http://localhost:8080/v1/users/u-1 \
   -H "Authorization: Bearer demo-token-123"
 ```
 
 ### 查询列表（分页）
+
 ```bash
 curl "http://localhost:8080/v1/users?page=1&page_size=10" \
   -H "Authorization: Bearer demo-token-123"
 ```
 
 ### 更新用户
+
 ```bash
 curl -X PATCH http://localhost:8080/v1/users/u-1 \
   -H "Authorization: Bearer demo-token-123" \
@@ -86,17 +92,20 @@ curl -X PATCH http://localhost:8080/v1/users/u-1 \
 ```
 
 ### 删除用户
+
 ```bash
 curl -X DELETE http://localhost:8080/v1/users/u-1 \
   -H "Authorization: Bearer demo-token-123"
 ```
 
 ### 不带 token（应返回 401 Unauthenticated）
+
 ```bash
 curl http://localhost:8080/v1/users/u-1
 ```
 
 ### 用原生 gRPC 调用（用 grpcurl 工具）
+
 ```bash
 grpcurl -plaintext \
   -H "authorization: Bearer demo-token-123" \
@@ -106,13 +115,13 @@ grpcurl -plaintext \
 
 ## 拦截器说明（你重点关心的部分）
 
-| 拦截器 | 作用域 | 文件 | 说明 |
-|---|---|---|---|
-| `UnaryRecoveryInterceptor` | gRPC | `recovery.go` | 捕获业务代码 panic，转成标准错误返回，不拖垮进程 |
-| `UnaryLoggingInterceptor` | gRPC | `logging.go` | 记录方法名、耗时、错误 |
-| `UnaryAuthInterceptor` | gRPC | `auth.go` | Bearer Token 鉴权；**因为 HTTP 请求经 grpc-gateway 转发时 Authorization header 会自动透传成 gRPC metadata，所以这一份鉴权逻辑同时覆盖 HTTP 和 gRPC 两个入口，不用写两遍** |
-| `CORSMiddleware` | HTTP | `http_middleware.go` | 标准 `net/http` middleware，包在 grpc-gateway 生成的 mux 外层 |
-| `HTTPLoggingMiddleware` | HTTP | `http_middleware.go` | HTTP 入口日志，方便和 gRPC 日志对照排查 |
+| 拦截器                     | 作用域 | 文件                 | 说明                                                                                                                                                                      |
+| -------------------------- | ------ | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `UnaryRecoveryInterceptor` | gRPC   | `recovery.go`        | 捕获业务代码 panic，转成标准错误返回，不拖垮进程                                                                                                                          |
+| `UnaryLoggingInterceptor`  | gRPC   | `logging.go`         | 记录方法名、耗时、错误                                                                                                                                                    |
+| `UnaryAuthInterceptor`     | gRPC   | `auth.go`            | Bearer Token 鉴权；**因为 HTTP 请求经 grpc-gateway 转发时 Authorization header 会自动透传成 gRPC metadata，所以这一份鉴权逻辑同时覆盖 HTTP 和 gRPC 两个入口，不用写两遍** |
+| `CORSMiddleware`           | HTTP   | `http_middleware.go` | 标准 `net/http` middleware，包在 grpc-gateway 生成的 mux 外层                                                                                                             |
+| `HTTPLoggingMiddleware`    | HTTP   | `http_middleware.go` | HTTP 入口日志，方便和 gRPC 日志对照排查                                                                                                                                   |
 
 **关键点**：grpc-gateway 生成的 mux 本质就是一个标准 `http.Handler`，所以社区里任何现成的 HTTP middleware
 （限流、gzip、JWT、Prometheus metrics 等，比如 [chi](https://github.com/go-chi/chi)、
