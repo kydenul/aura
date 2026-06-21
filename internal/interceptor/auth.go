@@ -15,7 +15,7 @@ import (
 
 // 不需要鉴权的方法白名单（按 FullMethod 匹配，例如健康检查）
 var authWhitelist = map[string]bool{
-	"/grpc.health.v1.Health/Check": true,
+	healthCheckMethod: true,
 }
 
 // UnaryAuthInterceptor 返回一个 gRPC 一元拦截器，组合社区成熟库实现 JWT 鉴权：

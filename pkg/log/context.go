@@ -120,15 +120,16 @@ func stringField(ctx context.Context, key string) string {
 	return ""
 }
 
-// mergeCtx 把 context 字段前置到本次调用显式传入的字段之前。
+// mergeCtx 把 context 链路字段（trace_id / span_id 等观测信息）追加到本次调用
+// 显式传入的业务字段之后，使日志里「有价值的业务数据在前、观测信息在后」，更易阅读。
 func mergeCtx(ctx context.Context, fields []Field) []Field {
 	cf := fieldsFromContext(ctx)
 	if len(cf) == 0 {
 		return fields
 	}
-	out := make([]Field, 0, len(cf)+len(fields))
-	out = append(out, cf...)
+	out := make([]Field, 0, len(fields)+len(cf))
 	out = append(out, fields...)
+	out = append(out, cf...)
 	return out
 }
 

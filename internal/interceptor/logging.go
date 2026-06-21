@@ -32,10 +32,10 @@ func UnaryLoggingInterceptor() grpc.UnaryServerInterceptor {
 // （trace_id / request_id 等），再按级别落地，从而让访问日志也带上链路信息。
 func zapLogAdapter() grpclogging.Logger {
 	return grpclogging.LoggerFunc(func(ctx context.Context, lvl grpclogging.Level, msg string, kv ...any) {
-		// 先放 context 链路字段，再放本次调用字段，保证 trace_id 等出现在前面。
+		// 先放本次调用的业务字段，再追加 context 链路字段，
+		// 保证有价值的数据在前、trace_id / span_id 等观测信息在后，便于阅读。
 		ctxFields := log.Fields(ctx)
-		fields := make([]log.Field, 0, len(ctxFields)+len(kv)/2+1)
-		fields = append(fields, ctxFields...)
+		fields := make([]log.Field, 0, len(kv)/2+len(ctxFields))
 		for i := 0; i+1 < len(kv); i += 2 {
 			key, ok := kv[i].(string)
 			if !ok {
@@ -43,6 +43,7 @@ func zapLogAdapter() grpclogging.Logger {
 			}
 			fields = append(fields, log.Any(key, kv[i+1]))
 		}
+		fields = append(fields, ctxFields...)
 
 		switch lvl {
 		case grpclogging.LevelDebug:

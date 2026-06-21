@@ -18,9 +18,11 @@ import (
 	"aura/internal/interceptor"
 	"aura/internal/service"
 	"aura/pkg/db"
+	"aura/pkg/hmac"
 	"aura/pkg/jwt"
 	"aura/pkg/log"
 	"aura/pkg/otel"
+	"aura/pkg/ratelimit"
 	"aura/pkg/redis"
 
 	"github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
@@ -51,7 +53,18 @@ func main() {
 
 	// ---------- 2. 初始化日志 ----------
 	// 统一日志组件（基于 zap）；OnReload 回调让日志级别改 yaml 后立即生效，无需重启。
-	if err := log.Init(log.Config{Level: cfg.Log.Level, Format: cfg.Log.Format}); err != nil {
+	if err := log.Init(log.Config{
+		Level:  cfg.Log.Level,
+		Format: cfg.Log.Format,
+		Output: cfg.Log.Output,
+		File: log.FileConfig{
+			Path:       cfg.Log.File.Path,
+			MaxSizeMB:  cfg.Log.File.MaxSizeMB,
+			MaxBackups: cfg.Log.File.MaxBackups,
+			MaxAgeDays: cfg.Log.File.MaxAgeDays,
+			Compress:   cfg.Log.File.Compress,
+		},
+	}); err != nil {
 		log.Fatalf("failed to init logger: %v", err)
 	}
 	config.OnReload(func() {
@@ -82,17 +95,31 @@ func main() {
 	closeInfra := initInfra(cfg)
 	defer closeInfra()
 
+	// 单机过载保护限流器：gRPC 入口拦截器使用。enabled/rps/burst 热更生效——
+	// OnReload 里调 Update 即时切换阈值（实例本身常驻，无需重启）。
+	rateLimiter := ratelimit.New(cfg.RateLimit.Enabled, cfg.RateLimit.RPS, cfg.RateLimit.Burst)
+	config.OnReload(func() {
+		rl := config.Get().RateLimit
+		rateLimiter.Update(rl.Enabled, rl.RPS, rl.Burst)
+	})
+
+	// HMAC 请求签名鉴权（面向服务间 / OpenAPI 调用）：未启用时返回 nil，HTTP 网关据此跳过签名中间件。
+	hmacMgr := initHMAC(cfg.HMAC)
+	// HMAC 防重放 nonce 去重存储：复用 Redis 单例（SETNX）。Redis 未启用时为 nil，
+	// 中间件将退化为仅靠时间窗防重放，这里给出告警。
+	nonceStore := buildHMACNonceStore(hmacMgr)
+
 	// ---------- 4. 启动三个 server（各自独立 goroutine）----------
 	// gRPC（:5568 内部高性能）/ HTTP gateway（:8080 外部 REST，经同进程 loopback 转发到 gRPC）
 	// / admin（:9090 运维，承载 metrics/health/pprof，与业务端口隔离）。
 	obs := cfg.Observability
-	grpcServer := newGRPCServer(jwtMgr)
+	grpcServer := newGRPCServer(jwtMgr, rateLimiter)
 	lis, err := net.Listen("tcp", cfg.Server.GRPCAddr)
 	if err != nil {
 		log.Fatalf("failed to listen on %s: %v", cfg.Server.GRPCAddr, err)
 	}
 
-	httpServer, err := newHTTPGatewayServer(ctx, cfg.Server)
+	httpServer, err := newHTTPGatewayServer(ctx, cfg.Server, hmacMgr, nonceStore, cfg.HMAC.ProtectedPrefixes)
 	if err != nil {
 		log.Fatalf("failed to create http gateway server: %v", err)
 	}
@@ -264,20 +291,57 @@ func serveAsync(name, addr string, serve func() error, fatal bool) {
 	}()
 }
 
+// initHMAC 按配置构建 HMAC 请求签名验签器；未启用时返回 nil（HTTP 网关据此跳过签名中间件，
+// 对现有 JWT 流程零影响）。启用但密钥缺失等配置错误直接 Fatal，避免"看似开启实则放行"。
+func initHMAC(cfg config.HMACConfig) *hmac.Manager {
+	if !cfg.Enabled {
+		return nil
+	}
+
+	keys := cfg.KeyMap()
+	mgr, err := hmac.NewManager(hmac.Config{Keys: keys, Skew: cfg.Skew()})
+	if err != nil {
+		log.Fatalf("failed to init hmac manager: %v", err)
+	}
+
+	log.Infof("✅ hmac request-signing auth enabled (%d app keys)", len(keys))
+	return mgr
+}
+
+// buildHMACNonceStore 在 HMAC 启用时返回基于 Redis SETNX 的 nonce 去重存储；
+// HMAC 未启用返回 nil；HMAC 启用但 Redis 未启用时返回 nil 并告警（防重放退化为仅时间窗）。
+// 必须在 initInfra（Redis 初始化）之后调用。
+func buildHMACNonceStore(hmacMgr *hmac.Manager) hmac.NonceStore {
+	if hmacMgr == nil {
+		return nil
+	}
+
+	store := interceptor.NewRedisNonceStore(redis.Get())
+	if store == nil {
+		log.Warn("⚠️  HMAC 已启用但 Redis 未启用：nonce 防重放退化为仅时间窗，建议开启 Redis")
+	}
+
+	return store
+}
+
 // newGRPCServer 创建 gRPC server，挂载业务 service 和拦截器链
-func newGRPCServer(jwtManager *jwt.Manager) *grpc.Server {
+func newGRPCServer(jwtManager *jwt.Manager, rateLimiter *ratelimit.Limiter) *grpc.Server {
 	server := grpc.NewServer(
 		// otelgrpc StatsHandler：依据 W3C traceparent 解析/生成 SpanContext 并注入 context，
 		// 同时产出 gRPC RED 指标（依赖全局 MeterProvider）。OpenTelemetry 官方 instrumentation。
 		grpc.StatsHandler(otelgrpc.NewServerHandler()),
 		// 拦截器按声明顺序执行（外 → 内）：
 		// recovery（兜底 panic）-> trace（把 OTel SpanContext 桥接成日志链路字段）
-		// -> logging（带 trace_id 打访问日志）-> auth（JWT 校验）-> 业务 handler。
-		// trace 必须在 logging 之前，logging 才能把 trace_id 一并打进访问日志。
+		// -> logging（带 trace_id 打访问日志）-> ratelimit（整机过载保护）-> auth（JWT 校验）
+		// -> 业务 handler。
+		// trace 必须在 logging 之前，logging 才能把 trace_id 一并打进访问日志；
+		// ratelimit 放在 logging 之后（被限请求仍有访问日志/trace_id 便于观测）、auth 之前
+		// （洪峰时在昂贵的 JWT 校验前就拒绝，省 CPU）。该限流经 gateway loopback 同时覆盖 HTTP 入口。
 		grpc.ChainUnaryInterceptor(
 			interceptor.UnaryRecoveryInterceptor(),
 			interceptor.UnaryTraceContextInterceptor(),
 			interceptor.UnaryLoggingInterceptor(),
+			interceptor.UnaryRateLimitInterceptor(rateLimiter),
 			interceptor.UnaryAuthInterceptor(jwtManager),
 		),
 	)
@@ -295,8 +359,14 @@ func newGRPCServer(jwtManager *jwt.Manager) *grpc.Server {
 
 // newHTTPGatewayServer 创建 HTTP server：
 // grpc-gateway 生成的 mux 负责把 /v1/users 这类 REST 请求翻译成 gRPC 调用，
-// 外层再包一层标准 net/http middleware（OTel、CORS、日志）
-func newHTTPGatewayServer(ctx context.Context, srv config.ServerConfig) (*http.Server, error) {
+// 外层再包一层标准 net/http middleware（OTel、CORS、日志，以及可选的 HMAC 签名鉴权）
+func newHTTPGatewayServer(
+	ctx context.Context,
+	srv config.ServerConfig,
+	hmacMgr *hmac.Manager,
+	nonces hmac.NonceStore,
+	hmacPrefixes []string,
+) (*http.Server, error) {
 	mux := runtime.NewServeMux(
 		// 自定义 JSON 序列化风格：
 		// - EmitUnpopulated: 零值字段也输出，前端联调更直观（不用猜字段是不是被裁掉了）
@@ -334,8 +404,14 @@ func newHTTPGatewayServer(ctx context.Context, srv config.ServerConfig) (*http.S
 	}
 
 	// HTTP 端 middleware 链（外 → 内）：
-	// otelhttp（解析 traceparent、起 server span）-> 写回 X-Trace-Id 响应头 -> CORS -> 日志 -> mux
+	// otelhttp（解析 traceparent、起 server span）-> 写回 X-Trace-Id 响应头 -> CORS
+	// -> 日志 -> HMAC 签名鉴权（仅启用时）-> mux
+	// HMAC 放在最内侧（紧贴 mux）：CORS 先处理 OPTIONS 预检不被签名拦截，且被拒请求仍被访问日志记录便于审计。
 	var handler http.Handler = mux
+	if hmacMgr != nil {
+		handler = interceptor.HMACAuthMiddlewareWith(hmacMgr, nonces, hmacPrefixes, handler)
+	}
+
 	handler = interceptor.HTTPLoggingMiddleware(handler)
 	handler = interceptor.CORSMiddlewareWith(corsOptionsFrom(srv.CORS), handler)
 	handler = interceptor.TraceResponseHeaderMiddleware(handler)

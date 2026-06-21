@@ -24,6 +24,12 @@ type Config struct {
 	// JWT token 签发与校验参数（【需重启】，启动时构建 jwt.Manager 单例）。
 	JWT JWTConfig `yaml:"jwt"`
 
+	// HMAC 请求签名鉴权（面向 OpenAPI / 机器对机器调用，【需重启】，启动时构建 hmac.Manager）。
+	HMAC HMACConfig `yaml:"hmac"`
+
+	// RateLimit gRPC 入口的单机过载保护限流（开关与阈值【热更生效】，经 OnReload 调 Limiter.Update）。
+	RateLimit RateLimitConfig `yaml:"ratelimit"`
+
 	// Log 日志级别与格式（【热更生效】）。
 	Log LogConfig `yaml:"log"`
 
@@ -123,10 +129,88 @@ func (c JWTConfig) TTL() time.Duration {
 	return time.Duration(c.TTLHours) * time.Hour
 }
 
+// HMACConfig 请求签名鉴权配置（TC-HMAC-SHA256），面向服务间 / OpenAPI 可信调用。
+// 算法见《JWT + HMAC 双层鉴权方案》外层 HMAC 规范，实现见 pkg/hmac。
+//
+// 默认 enabled=false，此时 HTTP 网关不挂签名中间件，对现有 JWT 流程零影响；
+// 开启后命中 ProtectedPrefixes 的 HTTP 请求需携带 X-Auth-AppId / X-Auth-Timestamp /
+// X-Auth-Nonce 以及 X-Auth-Sign: TC-HMAC-SHA256 Credential=<appid>,Signature=<SIG>。
+// 签名走独立头，不占用 Authorization（Authorization: Bearer 留给 JWT）。
+type HMACConfig struct {
+	// Enabled 是否启用 HMAC 请求签名鉴权（关闭则启动期不构建 Manager、HTTP 网关不挂中间件）。
+	Enabled bool `yaml:"enabled"`
+	// SkewSecs 允许的请求时间戳与服务端时钟最大偏移（秒），用于防重放；<=0 时使用代码默认值 300。
+	SkewSecs int `yaml:"skew_secs"`
+	// ProtectedPrefixes 仅对路径命中任一前缀的请求验签；为空表示保护全部路由。
+	// 用于把"机器调用走 HMAC 的开放接口"与"用户走 JWT 的普通接口"分开，避免全员双重鉴权。
+	ProtectedPrefixes []string `yaml:"protected_prefixes"`
+	// Keys 调用方凭据列表（app_id → secret），enabled=true 时至少需配置一条。
+	Keys []HMACKeyPair `yaml:"keys"`
+}
+
+// HMACKeyPair 一条 HMAC 调用方凭据：app_id 即 X-Auth-AppId / X-Auth-Sign 中的 Credential，
+// secret 为共享密钥（建议通过环境变量注入，避免硬编码到 yaml）。
+type HMACKeyPair struct {
+	AppID  string `yaml:"app_id"`
+	Secret string `yaml:"secret"`
+}
+
+// Skew 返回允许的时间窗 time.Duration。
+func (c HMACConfig) Skew() time.Duration {
+	return time.Duration(c.SkewSecs) * time.Second
+}
+
+// KeyMap 把 Keys 列表投影成 app_id → secret 的 map，供 hmac.NewManager 使用。
+func (c HMACConfig) KeyMap() map[string]string {
+	m := make(map[string]string, len(c.Keys))
+	for _, kp := range c.Keys {
+		if kp.AppID == "" || kp.Secret == "" {
+			continue
+		}
+		m[kp.AppID] = kp.Secret
+	}
+	return m
+}
+
 // LogConfig 日志配置。
+//
+// Level / Format【热更生效】；Output 与 File.* 涉及输出目标与文件句柄，
+// 启动时装配，属【需重启】。
 type LogConfig struct {
 	Level  string `yaml:"level"`  // debug | info | warn | error
 	Format string `yaml:"format"` // text | json
+
+	// Output 输出目标：stdout（默认，容器/云原生推荐）| file | both。
+	Output string `yaml:"output"`
+	// File 文件滚动参数，仅当 Output 为 file / both 时生效。
+	File LogFileConfig `yaml:"file"`
+}
+
+// LogFileConfig 日志文件滚动（rotation）参数，底层由 lumberjack 实现，
+// 防止日志文件无限膨胀导致磁盘占满 / 检索困难。
+type LogFileConfig struct {
+	Path       string `yaml:"path"`         // 日志文件路径，Output 含 file 时必填
+	MaxSizeMB  int    `yaml:"max_size_mb"`  // 单文件最大体积（MB），超过即切割
+	MaxBackups int    `yaml:"max_backups"`  // 最多保留的旧文件个数
+	MaxAgeDays int    `yaml:"max_age_days"` // 旧文件最长保留天数
+	Compress   bool   `yaml:"compress"`     // 是否 gzip 压缩切割后的旧文件
+}
+
+// RateLimitConfig 单机令牌桶过载保护配置（实现见 pkg/ratelimit）。
+//
+// 挂在 gRPC 入口拦截器上：由于 HTTP REST 经 grpc-gateway 同进程 loopback 转发到 gRPC，
+// 这一道限流可同时覆盖 gRPC 直连与 HTTP 两个入口（与 JWT 鉴权同款契约），HTTP 中间件无需重复挂。
+// 被限流时 gRPC 返回 codes.ResourceExhausted，网关自动映射为 HTTP 429。
+//
+// 这是「单实例」过载保护（进程内、零外部依赖）：多副本各自独立计数，整体容量 ≈ rps × 副本数。
+// enabled / rps / burst 均【热更生效】：改 yaml 后经 OnReload 调 Limiter.Update 即时切换，无需重启。
+type RateLimitConfig struct {
+	// Enabled 是否启用过载保护；false 或 rps<=0 时恒放行（不限流）。
+	Enabled bool `yaml:"enabled"`
+	// RPS 整机每秒允许的平均请求数（令牌产生速率）。
+	RPS float64 `yaml:"rps"`
+	// Burst 突发桶容量（瞬时可同时通过的最大请求数）；<1 时自动取 1。
+	Burst int `yaml:"burst"`
 }
 
 // DatabaseConfig 关系型数据库配置。
@@ -176,9 +260,26 @@ func newDefaultConfig() *Config {
 			Issuer:   "aura",
 			TTLHours: 2,
 		},
+		HMAC: HMACConfig{
+			Enabled:  false,
+			SkewSecs: 300,
+		},
 		Log: LogConfig{
 			Level:  "info",
 			Format: "text",
+			Output: "stdout",
+			File: LogFileConfig{
+				Path:       "logs/aura.log",
+				MaxSizeMB:  100,
+				MaxBackups: 10,
+				MaxAgeDays: 30,
+				Compress:   true,
+			},
+		},
+		RateLimit: RateLimitConfig{
+			Enabled: false,
+			RPS:     0,
+			Burst:   0,
 		},
 		Database: DatabaseConfig{
 			Driver:              "mysql",

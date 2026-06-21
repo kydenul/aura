@@ -18,6 +18,26 @@
 - 失败错误可用 `errors.Is` 与 `ErrTokenExpired` / `ErrInvalidToken` 精确比对；包装格式 `%w: %v` 同时保留底层库的诊断信息。
 - `Secret` 必填，生产务必从环境变量 / 密钥管理服务注入，勿硬编码。HS256 推荐 >= 32 字节（256bit）；`cmd/server` 启动期会对命中调试占位值或长度过短的密钥打印告警。
 
+## hmac/ — 请求签名（TC-HMAC-SHA256）
+
+外层 HMAC 验"信封"：调用方身份（appid）+ body 完整性 + 防重放，面向 OpenAPI / 机器对机器调用。与 `jwt/`（用户登录态）正交：HTTP 入口先验 HMAC、再走 JWT，两层鉴权互不干扰。
+
+| 文件         | 导出                                                                                                                                                  | 说明                                                                                                            |
+| ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| `hmac.go`    | `Manager`、`NewManager(Config)`、`Verify`、`Sign`、`CanonicalRequest`、`CanonicalQuery`、`ParseSignatureHeader`、`Scheme`、`Header*`、`ErrXxx` | 签名 / 验签，规范请求串构造，`Manager` 并发安全可作单例                                                         |
+| `nonce.go`   | `NonceStore`（接口）                                                                                                                                  | 防重放去重抽象；具体存储（Redis SETNX）实现在 `internal/interceptor/hmac_middleware.go`，pkg 侧零依赖           |
+| `context.go` | `NewContext`、`FromContext`                                                                                                                           | 通过验签的 appid 注入 / 读取                                                                                    |
+
+要点：
+
+- **规范请求串字段固定 7 行**：`TC-HMAC-SHA256\nMETHOD\nPATH\nCANONICAL_QUERY\nHEX(SHA256(BODY))\nTIMESTAMP\nNONCE`；签名 = 大写 HEX(HMAC-SHA256(secret, 规范串))。appid 不入串，仅用于选 secret。
+- **签名走独立头 `X-Auth-Sign`**：值形如 `TC-HMAC-SHA256 Credential=<appid>,Signature=<SIG>`；其余头 `X-Auth-AppId` / `X-Auth-Timestamp` / `X-Auth-Nonce`。`Authorization: Bearer` 留给 JWT。
+- **`CanonicalQuery` 对同名 key 多值全部签**（key 字典序 + 同 key 内值字典序）。若只签首值，攻击者可在 `?a=1&a=2` 里追加额外值不破坏签名——body 之外的"隐形通道"必须堵死。
+- **常量时间比对**：`Verify` 用 `hmac.Equal` 比签名，避免按字节短路被时序侧信道探测出正确前缀。
+- **防重放两道闸**：① 时间窗（`Skew`，默认 300s，`Verify` 内判定 `|now-ts| > Skew` 则拒）；② nonce 去重（`NonceStore`）。中间件传给存储的 TTL 必须取 `2×Skew`：覆盖正负向偏移并留出过期精度余量，否则边界缝隙可重放。
+- **失败错误可 `errors.Is`** 精确判断：`ErrMissingSignature` / `ErrUnknownAppID` / `ErrTimestampExpired` / `ErrInvalidSignature`。
+- **为什么只挂 HTTP 入口（不走 gRPC 拦截器）**：grpc-gateway 会把 HTTP/JSON body 重编码为 protobuf 再 loopback 转发，body 字节已变，gRPC 侧无法复现签名串。详见 `internal/interceptor/hmac_middleware.go`。
+
 ## log/ — 结构化日志
 
 封装 `go.uber.org/zap`，单例 + 包级便捷函数，import 即用，无需层层传 logger。
@@ -83,6 +103,21 @@
 - **OTel 集成**：`tracing.enabled=true` 时 `main` 调用 `redis.InstrumentTracing()`，每条命令一个 span；`metrics.enabled=true` 时调用 `redis.InstrumentMetrics()`，pool & 命令耗时并入 `/metrics`。
 - `/readyz` 通过 `redis.Get().Ping(ctx)` 探活，与 DB 共享 2s 超时。
 
+## ratelimit/ — 单机令牌桶限流（进程内）
+
+封装 Go 官方扩展库 [`golang.org/x/time/rate`](https://pkg.go.dev/golang.org/x/time/rate) 的令牌桶算法，做**纯进程内**过载保护，零网络 / 零外部依赖。与 `redis/` 的 `SlidingWindowLimiter`（分布式、跨实例全局一致）**互补**：前者防单实例瞬时洪峰打崩接口，后者做跨实例全局配额。多副本部署时各实例独立计数（整体容量 ≈ 单实例阈值 × 副本数）。
+
+| 文件         | 导出                                                                                                                 | 说明                                                                                                                                                          |
+| ------------ | -------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `limiter.go` | `Limiter`、`New(enabled, rps, burst)`、`KeyedLimiter`、`NewKeyed(enabled, rps, burst, ttl, maxKeys)`、`Allow`、`Update`、`Reconfigure`、`Enabled`、`Size` | `Limiter` 全局共享一个桶（防总流量打崩下游）；`KeyedLimiter` 按 key（如 client IP / user_id）独立桶（防单一来源独占容量），不活跃 key 惰性 GC + `maxKeys` 上限防伪造 key 内存放大攻击 |
+
+要点：
+
+- `rps` 控稳态平均速率、`burst` 控瞬时突发上限；`rps<=0` 视为不限速（`rate.Inf`），`burst<1` 自动取 1。
+- **fail-open 设计**：`enabled=false` / `rps<=0` / nil receiver / 空 key 一律恒放行，限流是兜底而非主路径。
+- **热更不送免费 burst**：`KeyedLimiter.Reconfigure` 对现存桶**原地** `SetLimit/SetBurst`，不清空——否则攻击者反复触发 reload 即可白嫖满血 burst。配合 `config.OnReload` 调 `Update/Reconfigure` 即可不重启改阈值。
+- `nowFn` 可注入虚拟时钟，GC / TTL 逻辑单测不依赖 `time.Sleep`。
+
 ## 组件协作
 
 ```
@@ -109,4 +144,6 @@ service ────InfoContext─读─> 自动带链路字段输出
 | 加自定义业务指标  | `otel.GetMeterProvider().Meter("...")` 创建 counter / histogram，自动并入 `/metrics`                       |
 | 用数据库          | 配置 `database.enabled: true` + `dsn`；业务侧 `db.Get().WithContext(ctx)` 拿 `*gorm.DB`（带 ctx 才能续 trace） |
 | 用 Redis          | 配置 `redis.enabled: true` + 连接参数；业务侧 `redis.Get()` 拿 `*Client`                                   |
-| 加接口限流        | `redis.NewSlidingWindowLimiter(redis.Get(), "ratelimit:xxx", limit, window)` 后在拦截器/handler 调 `Allow` |
+| 加分布式接口限流  | `redis.NewSlidingWindowLimiter(redis.Get(), "ratelimit:xxx", limit, window)` 后在拦截器/handler 调 `Allow` |
+| 加单机过载保护    | `ratelimit.New(true, rps, burst)`（全局）或 `ratelimit.NewKeyed(...)`（按 IP/用户）后在拦截器调 `Allow`     |
+| 给 OpenAPI 加签名鉴权 | 配置 `hmac.enabled: true` + `keys` + `protected_prefixes`；服务侧通过 `hmac.FromContext(ctx)` 取 appid |

@@ -121,7 +121,7 @@ func TestAuthInterceptorWhitelistSkips(t *testing.T) {
 	_, err := interceptor(
 		context.Background(),
 		nil,
-		&grpc.UnaryServerInfo{FullMethod: "/grpc.health.v1.Health/Check"},
+		&grpc.UnaryServerInfo{FullMethod: healthCheckMethod},
 		okHandler(&called),
 	)
 	if err != nil {

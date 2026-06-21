@@ -30,10 +30,50 @@ jwt:
   issuer: "aura"
   ttl_hours: 2                       # token 有效期（小时）
 
+# ── HMAC 请求签名鉴权（TC-HMAC-SHA256，面向 OpenAPI / 机器对机器调用）─────────
+# 外层 HMAC 验"信封"（调用方身份 + body 完整性 + 防重放），算法见《JWT + HMAC 双层鉴权方案》。
+# 调用方与本服务预共享 app_id / secret，请求时携带（独立头，不占用 Authorization）：
+#   X-Auth-AppId / X-Auth-Timestamp(Unix 秒) / X-Auth-Nonce
+#   X-Auth-Sign: TC-HMAC-SHA256 Credential=<app_id>,Signature=<大写HEX>
+# 规范请求串 = TC-HMAC-SHA256\nMETHOD\nPATH\nCANONICAL_QUERY\nHEX(SHA256(BODY))\nTIMESTAMP\nNONCE
+# 签名 = ToUpper(HEX(HMAC_SHA256(secret, 规范请求串)))；详见 pkg/hmac。
+# Authorization: Bearer 仍留给 JWT，两层鉴权互不干扰。
+# enabled=false（默认）时 HTTP 网关不挂签名中间件，对现有 JWT 流程零影响。
+# 防重放需要 Redis（SETNX nonce 去重）；Redis 未启用时退化为仅时间窗。
+hmac:
+  enabled: false
+  skew_secs: 300                     # 请求时间戳与服务端时钟最大偏移（秒），防重放
+  protected_prefixes: []             # 仅对命中前缀的路由验签（如 ["/v1/openapi/"]）；留空=保护全部
+  keys:                              # enabled=true 时至少配置一条；secret 建议用环境变量注入
+    - app_id: "101"
+      secret: "${HMAC_SECRET_101}"
+
 # ── 日志 ──────────────────────────────────────────────────────────────────────
+# level / format 热更生效；output 与 file.* 属【需重启】。
+# output=stdout（默认）适合容器/云原生（滚动归档交给采集侧 Fluent Bit / Loki）；
+# output=file / both 时启用进程内文件滚动（lumberjack）：单文件超 max_size_mb 自动切割，
+# 并按 max_backups（个数）与 max_age_days（天数）清理旧文件，防止日志无限膨胀占满磁盘。
 log:
   level: "info"                      # debug | info | warn | error
   format: "text"                     # text | json
+  output: "stdout"                   # stdout | file | both
+  file:
+    path: "logs/aura.log"            # 日志文件路径（output 含 file 时生效）
+    max_size_mb: 100                 # 单文件最大体积（MB），超过即切割
+    max_backups: 10                  # 最多保留的旧文件个数
+    max_age_days: 30                 # 旧文件最长保留天数
+    compress: true                   # 是否 gzip 压缩切割后的旧文件
+
+# ── 限流（单机过载保护）──────────────────────────────────────────────────────
+# 挂在 gRPC 入口拦截器上。由于 HTTP REST 经 grpc-gateway 同进程 loopback 转发到 gRPC，
+# 这一道限流同时覆盖 gRPC 直连与 HTTP 两个入口（与 JWT 鉴权同款契约），HTTP 端无需重复挂。
+# 被限流时 gRPC 返回 ResourceExhausted，网关自动映射为 HTTP 429。
+# 这是「单实例」过载保护：多副本各自独立计数，整体容量 ≈ rps × 副本数。
+# enabled / rps / burst 均热更生效，改 yaml 即时切换无需重启。
+ratelimit:
+  enabled: false                     # 是否启用过载保护（false 或 rps<=0 恒放行）
+  rps: 0                             # 整机每秒允许的平均请求数（令牌产生速率）
+  burst: 0                           # 突发桶容量（瞬时可同时通过的最大请求数）；<1 自动取 1
 
 # ── 数据库 ────────────────────────────────────────────────────────────────────
 database:

@@ -21,6 +21,7 @@ import (
 
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
+	lumberjack "gopkg.in/natefinch/lumberjack.v2"
 )
 
 // 支持的日志输出格式。
@@ -29,12 +30,39 @@ const (
 	FormatJSON = "json" // 结构化 JSON，每行一条，适合生产日志采集
 )
 
+// 支持的日志输出目标。
+const (
+	OutputStdout = "stdout" // 仅写标准输出（云原生 / 容器默认，滚动交给采集侧）
+	OutputFile   = "file"   // 仅写文件，按大小自动切割（lumberjack），防止单文件无限膨胀
+	OutputBoth   = "both"   // 同时写 stdout 与文件
+)
+
 // Config 是日志组件的配置项，字段与 config.LogConfig 一一对应。
 type Config struct {
 	// Level 日志级别：debug | info | warn | error，留空按 info 处理。
 	Level string
 	// Format 输出格式：text | json，非 json 一律按 text 处理。
 	Format string
+	// Output 输出目标：stdout（默认）| file | both，非法值按 stdout 处理。
+	Output string
+	// File 文件滚动参数，仅当 Output 含 file 时生效。
+	File FileConfig
+}
+
+// FileConfig 是日志文件滚动（rotation）参数，底层由 lumberjack 实现：
+// 单文件超过 MaxSizeMB 即切割，并按 MaxBackups / MaxAgeDays 清理旧文件，
+// 从而避免日志文件无限膨胀导致磁盘占满 / 查询困难。
+type FileConfig struct {
+	// Path 日志文件路径，Output 含 file 时必填（为空则退化为仅 stdout）。
+	Path string
+	// MaxSizeMB 单个日志文件最大体积（MB），超过即触发切割；<=0 时按 lumberjack 默认 100。
+	MaxSizeMB int
+	// MaxBackups 最多保留的旧日志文件个数；<=0 表示不按个数清理（谨慎，可能堆积）。
+	MaxBackups int
+	// MaxAgeDays 旧日志文件最长保留天数；<=0 表示不按时间清理。
+	MaxAgeDays int
+	// Compress 是否用 gzip 压缩切割后的旧日志文件，省磁盘。
+	Compress bool
 }
 
 // Field 是结构化日志字段别名，调用方统一从本包引用，无需直接 import zap。
@@ -70,23 +98,28 @@ var (
 	skipSugar *zap.SugaredLogger
 	// atomicLevel 持有当前级别，支持运行期热更而无需重建 logger。
 	atomicLevel = zap.NewAtomicLevelAt(zapcore.InfoLevel)
+	// fileCloser 持有当前文件输出（lumberjack）的句柄，重建 logger 时关闭旧文件，
+	// 避免句柄泄漏；stdout 输出时为 nil。
+	fileCloser io.Closer
 )
 
-// init 在 Init 被调用前提供一个安全可用的默认 logger（text/info），
+// init 在 Init 被调用前提供一个安全可用的默认 logger（text/info/stdout），
 // 避免任何早于 Init 的日志调用触发空指针。
 func init() {
-	store(build(FormatText, atomicLevel))
+	l, _ := build(Config{Format: FormatText, Output: OutputStdout}, atomicLevel)
+	store(l, nil)
 }
 
 // Init 根据配置初始化全局日志组件，通常在程序启动时调用一次。
-// 重复调用会按新配置重建 logger（如 format 变化），并发安全。
+// 重复调用会按新配置重建 logger（如 format / output 变化），并发安全。
 func Init(cfg Config) error {
 	lvl, err := parseLevel(cfg.Level)
 	if err != nil {
 		return err
 	}
 	atomicLevel.SetLevel(lvl)
-	store(build(cfg.Format, atomicLevel))
+	l, closer := build(cfg, atomicLevel)
+	store(l, closer)
 	return nil
 }
 
@@ -100,38 +133,81 @@ func SetLevel(level string) error {
 	return nil
 }
 
-// build 按 format 构造一个写到 stdout 的 zap.Logger，级别由 atomicLevel 动态控制。
-func build(format string, lvl zap.AtomicLevel) *zap.Logger {
+// build 按配置构造 zap.Logger 及（可选的）文件输出句柄：
+//   - 编码器按 format 选择 console（text）或 json；
+//   - 写入目标按 output 选择 stdout / 文件（lumberjack 滚动）/ 二者并写；
+//   - 级别由 atomicLevel 动态控制，支持热更。
+//
+// 返回的 io.Closer 为文件输出句柄（stdout-only 时为 nil），由 store 负责在
+// 替换 logger 时关闭旧句柄。
+func build(cfg Config, lvl zap.AtomicLevel) (*zap.Logger, io.Closer) {
 	encCfg := zap.NewProductionEncoderConfig()
 	encCfg.TimeKey = "ts"
 	encCfg.MessageKey = "msg"
 	encCfg.EncodeTime = zapcore.ISO8601TimeEncoder
 	encCfg.EncodeDuration = zapcore.StringDurationEncoder
 
+	ws, closer := buildWriteSyncer(cfg)
+	// 彩色级别只在「纯 stdout」时启用：写文件时 ANSI 转义码会污染日志、干扰检索。
+	colorize := closer == nil
+
 	var encoder zapcore.Encoder
-	if strings.EqualFold(format, FormatJSON) {
+	if strings.EqualFold(cfg.Format, FormatJSON) {
 		encCfg.EncodeLevel = zapcore.LowercaseLevelEncoder
 		encoder = zapcore.NewJSONEncoder(encCfg)
 	} else {
-		// text：控制台编码器 + 彩色大写级别，人类可读，便于本地排查。
-		encCfg.EncodeLevel = zapcore.CapitalColorLevelEncoder
+		// text：控制台编码器，人类可读，便于本地排查。
+		if colorize {
+			encCfg.EncodeLevel = zapcore.CapitalColorLevelEncoder
+		} else {
+			encCfg.EncodeLevel = zapcore.CapitalLevelEncoder
+		}
 		encoder = zapcore.NewConsoleEncoder(encCfg)
 	}
 
-	core := zapcore.NewCore(encoder, zapcore.Lock(os.Stdout), lvl)
+	core := zapcore.NewCore(encoder, ws, lvl)
 	// error 及以上自动附带堆栈，方便定位。
-	return zap.New(core, zap.AddCaller(), zap.AddStacktrace(zapcore.ErrorLevel))
+	return zap.New(core, zap.AddCaller(), zap.AddStacktrace(zapcore.ErrorLevel)), closer
 }
 
-// store 原子替换全局 logger 及其衍生实例。
-func store(l *zap.Logger) {
+// buildWriteSyncer 按 output 决定日志写入目标：
+//   - file / both：经 lumberjack 写文件，单文件超阈值自动切割并按个数/天数清理；
+//   - 其余（含非法值或文件路径为空）：退化为仅 stdout，保证日志永不丢失。
+func buildWriteSyncer(cfg Config) (zapcore.WriteSyncer, io.Closer) {
+	wantFile := strings.EqualFold(cfg.Output, OutputFile) || strings.EqualFold(cfg.Output, OutputBoth)
+	if !wantFile || strings.TrimSpace(cfg.File.Path) == "" {
+		return zapcore.Lock(os.Stdout), nil
+	}
+
+	lj := &lumberjack.Logger{
+		Filename:   cfg.File.Path,
+		MaxSize:    cfg.File.MaxSizeMB,
+		MaxBackups: cfg.File.MaxBackups,
+		MaxAge:     cfg.File.MaxAgeDays,
+		Compress:   cfg.File.Compress,
+	}
+
+	if strings.EqualFold(cfg.Output, OutputBoth) {
+		ws := zapcore.NewMultiWriteSyncer(zapcore.Lock(os.Stdout), zapcore.AddSync(lj))
+		return ws, lj
+	}
+	return zapcore.AddSync(lj), lj
+}
+
+// store 原子替换全局 logger 及其衍生实例，并关闭被替换掉的旧文件句柄。
+func store(l *zap.Logger, closer io.Closer) {
 	mu.Lock()
 	defer mu.Unlock()
+	old := fileCloser
 	base = l
 	baseSugar = l.Sugar()
 	skip := l.WithOptions(zap.AddCallerSkip(1))
 	skipLog = skip
 	skipSugar = skip.Sugar()
+	fileCloser = closer
+	if old != nil && old != closer {
+		_ = old.Close()
+	}
 }
 
 // parseLevel 把字符串级别解析为 zapcore.Level，留空按 info 处理。
@@ -226,7 +302,7 @@ func SetOutputForTesting(w io.Writer) (restore func()) {
 	encCfg := zap.NewProductionEncoderConfig()
 	encCfg.EncodeLevel = zapcore.CapitalLevelEncoder
 	core := zapcore.NewCore(zapcore.NewConsoleEncoder(encCfg), zapcore.AddSync(w), atomicLevel)
-	store(zap.New(core))
+	store(zap.New(core), nil)
 
 	return func() {
 		mu.Lock()

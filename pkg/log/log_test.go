@@ -2,6 +2,8 @@ package log
 
 import (
 	"bytes"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -121,10 +123,10 @@ func TestFormattedOutput(t *testing.T) {
 }
 
 func TestBuildBothFormats(t *testing.T) {
-	if build(FormatText, atomicLevel) == nil {
+	if l, _ := build(Config{Format: FormatText, Output: OutputStdout}, atomicLevel); l == nil {
 		t.Error("build(text) 返回 nil")
 	}
-	if build(FormatJSON, atomicLevel) == nil {
+	if l, _ := build(Config{Format: FormatJSON, Output: OutputStdout}, atomicLevel); l == nil {
 		t.Error("build(json) 返回 nil")
 	}
 }
@@ -132,5 +134,54 @@ func TestBuildBothFormats(t *testing.T) {
 func TestAccessorsNotNil(t *testing.T) {
 	if L() == nil || S() == nil || logger() == nil || sugar() == nil {
 		t.Fatal("logger 访问器不应返回 nil")
+	}
+}
+
+// TestFileOutputWritesToFile 验证 output=file 时日志落到文件，且切回 stdout 后旧文件句柄被关闭。
+func TestFileOutputWritesToFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.log")
+
+	t.Cleanup(func() { _ = Init(Config{Level: "info", Format: "text", Output: OutputStdout}) })
+
+	if err := Init(Config{
+		Level:  "info",
+		Format: "json",
+		Output: OutputFile,
+		File: FileConfig{
+			Path:       path,
+			MaxSizeMB:  1,
+			MaxBackups: 2,
+			MaxAgeDays: 7,
+			Compress:   false,
+		},
+	}); err != nil {
+		t.Fatalf("Init(file) error: %v", err)
+	}
+
+	Info("file-rotation-works", String("uid", "u-9"))
+	_ = Sync()
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("读取日志文件失败: %v", err)
+	}
+	out := string(data)
+	for _, want := range []string{"file-rotation-works", "uid", "u-9"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("日志文件缺少 %q\n实际:\n%s", want, out)
+		}
+	}
+	// 文件模式不应写入 ANSI 颜色码。
+	if strings.Contains(out, "\x1b[") {
+		t.Errorf("文件日志不应包含 ANSI 颜色码\n实际:\n%s", out)
+	}
+}
+
+// TestFileOutputEmptyPathFallsBackToStdout 验证 output=file 但 path 为空时退化为 stdout（不 panic、不建文件）。
+func TestFileOutputEmptyPathFallsBackToStdout(t *testing.T) {
+	_, closer := build(Config{Format: FormatText, Output: OutputFile, File: FileConfig{Path: "  "}}, atomicLevel)
+	if closer != nil {
+		t.Error("path 为空时应退化为 stdout，closer 应为 nil")
 	}
 }
