@@ -1,0 +1,89 @@
+syntax = "proto3";
+
+package user.v1;
+
+option go_package = "aura/gen/proto;userv1";
+
+import "google/api/annotations.proto";
+import "google/protobuf/empty.proto";
+
+// UserService 提供用户的增删改查能力
+// 通过 google.api.http annotation 声明 HTTP <-> gRPC 的映射关系
+service UserService {
+  // 创建用户
+  // HTTP: POST /v1/users  Body: { "name": "...", "email": "..." }
+  rpc CreateUser(CreateUserRequest) returns (User) {
+    option (google.api.http) = {
+      post: "/v1/users"
+      body: "*"
+    };
+  }
+
+  // 查询单个用户
+  // HTTP: GET /v1/users/{id}
+  rpc GetUser(GetUserRequest) returns (User) {
+    option (google.api.http) = {
+      get: "/v1/users/{id}"
+    };
+  }
+
+  // 查询用户列表（带分页 query 参数）
+  // HTTP: GET /v1/users?page=1&page_size=10
+  rpc ListUsers(ListUsersRequest) returns (ListUsersResponse) {
+    option (google.api.http) = {
+      get: "/v1/users"
+    };
+  }
+
+  // 更新用户
+  // HTTP: PATCH /v1/users/{id}  Body: { "name": "..." }
+  rpc UpdateUser(UpdateUserRequest) returns (User) {
+    option (google.api.http) = {
+      patch: "/v1/users/{id}"
+      body: "user"
+    };
+  }
+
+  // 删除用户
+  // HTTP: DELETE /v1/users/{id}
+  rpc DeleteUser(DeleteUserRequest) returns (google.protobuf.Empty) {
+    option (google.api.http) = {
+      delete: "/v1/users/{id}"
+    };
+  }
+}
+
+message User {
+  string id = 1;
+  string name = 2;
+  string email = 3;
+  int64 created_at = 4;
+}
+
+message CreateUserRequest {
+  string name = 1;
+  string email = 2;
+}
+
+message GetUserRequest {
+  string id = 1;
+}
+
+message ListUsersRequest {
+  int32 page = 1;
+  int32 page_size = 2;
+}
+
+message ListUsersResponse {
+  repeated User users = 1;
+  int32 total = 2;
+}
+
+message UpdateUserRequest {
+  string id = 1;
+  User user = 2;
+}
+
+message DeleteUserRequest {
+  string id = 1;
+}

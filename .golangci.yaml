@@ -1,0 +1,143 @@
+version: "2"
+
+linters:
+  # Enable specific linter.
+  enable:
+    - asciicheck # Checks that all code identifiers does not have non-ASCII symbols in the name. [fast]
+    - bodyclose # Checks whether HTTP response body is closed successfully.
+    - containedctx # Containedctx is a linter that detects struct contained context.Context field.
+    - contextcheck # Check whether the function uses a non-inherited context.
+    - copyloopvar # A linter detects places where loop variables are copied. [fast, auto-fix]
+    - cyclop # Checks function and package cyclomatic complexity. [fast]
+    - errcheck # Errcheck is a program for checking for unchecked errors in Go code. These unchecked errors can be critical bugs in some cases
+    - funlen # Checks for long functions. [fast]
+    - goconst # Finds repeated strings that could be replaced by a constant.
+    - gocyclo # Computes and checks the cyclomatic complexity of functions. [fast]
+    - goprintffuncname # Checks that printf-like functions are named with `f` at the end. [fast]
+    - gosec # Inspects source code for security problems.
+    - govet # Vet examines Go source code and reports suspicious constructs. It is roughly the same as 'go vet' and uses its passes. [auto-fix]
+    - ineffassign # Detects when assignments to existing variables are not used. [fast]
+    - iface # Detect the incorrect use of interfaces, helping developers avoid interface pollution. [auto-fix]
+    - lll # Reports long lines. [fast]
+    - misspell # Finds commonly misspelled English words. [fast, auto-fix]
+    - makezero # Finds slice declarations with non-zero initial length.
+    - nilerr # Finds the code that returns nil even if it checks that the error is not nil.
+    - revive # Fast, configurable, extensible, flexible, and beautiful linter for Go. Drop-in replacement of golint. [auto-fix]
+    - rowserrcheck # Checks whether Rows.Err of rows is checked successfully.
+    - staticcheck # It's the set of rules from staticcheck. [auto-fix]
+    - perfsprint # Checks that fmt.Sprintf can be replaced with a faster alternative. [auto-fix]
+    - prealloc # Finds slice declarations that could potentially be pre-allocated. [fast]
+    - tagalign # Check that struct tags are well aligned. [fast, auto-fix]
+    - unconvert # Remove unnecessary type conversions.
+    - unparam # Reports unused function parameters.
+    - unused # Checks Go code for unused constants, variables, functions and types.
+    - whitespace # Whitespace is a linter that checks for unnecessary newlines at the start and end of functions, if, for, etc. [fast, auto-fix]
+
+  # All available settings of specific linters.
+  settings:
+    gosec:
+      excludes:
+        - G402 # TLS InsecureSkipVerify
+        - G102 # Bind to all interfaces：服务端监听端口需绑定 0.0.0.0，属预期行为
+    funlen:
+      lines: 150
+      statements: 100
+    goconst:
+      min-len: 5
+      min-occurrences: 3
+    lll:
+      line-length: 120
+    cyclop:
+      max-complexity: 24
+    errcheck:
+      check-type-assertions: true
+      check-blank: false
+      disable-default-exclusions: false
+      exclude-functions:
+        - (io.Closer).Close
+        - (*os.File).Close
+        - (redis.Conn).Close
+        - os.Remove
+        - os.ReadFile # Replace deprecated io/ioutil.ReadFile
+        - io.Copy(*bytes.Buffer)
+        - io.Copy(os.Stdout)
+    revive:
+      severity: error # warning # error
+      enable-all-rules: false
+      rules:
+        - name: blank-imports # Disallow blank imports (`.`)
+        - name: increment-decrement # Enforce `i++` and `i--` syntax
+        - name: superfluous-else # Avoid unnecessary `else` blocks after an `if` that breaks flow
+        - name: empty-block # Warn on empty code blocks
+        - name: if-return # Simplify redundant `return` after `if` statements
+        - name: unexported-return # Warn when exported functions return unexported types
+        - name: context-as-argument # Enforce `context.Context` as the first function argument
+        - name: error-return # Enforce error values as the last return value
+        - name: empty-lines # Detect superfluous blank lines at the start or end of blocks
+        - name: unreachable-code # Warn on unreachable code
+        - name: var-naming # Enforce Go variable naming conventions
+        - name: unused-parameter # Suggest renaming or removing unused function parameters
+          arguments:
+            - allow-regex: "^_" # Allow unused parameters prefixed with `_`
+        - name: errorf # Suggest replacing `errors.New(fmt.Sprintf())` with `fmt.Errorf()`
+        - name: time-equal # Suggest using `time.Time.Equal` for time comparisons
+        - name: time-naming # Enforce naming conventions for `time.Time` variables
+        - name: redefines-builtin-id # Warn when redefining built-in identifiers
+        - name: bare-return # Warn on bare (naked) return statements
+        - name: defer # Check for common mistakes in `defer` usage
+        - name: early-return # Encourage early returns to reduce nesting
+        - name: optimize-operands-order # Suggest optimal operand ordering in expressions
+        - name: receiver-naming # Enforce consistent receiver naming conventions
+        - name: use-any # Prefer `any` over `interface{}`
+
+  # Defines a set of rules to ignore issues.
+  # It does not skip the analysis, and so does not ignore "typecheck" errors.
+  exclusions:
+    # Log a warning if an exclusion rule is unused.
+    warn-unused: true
+    # Excluding configuration per-path, per-linter, per-text and per-source.
+    rules:
+      # Exclude some linters from running on tests files.
+      - path: _test\.go
+        linters:
+          - all
+          - errcheck
+          - unused
+          - gosec
+          - lll
+          - revive
+          - perfsprint
+          - unparam
+          - dupl
+          - goconst
+          - golines
+          - cyclop
+          - govet
+          - ineffassign
+          - prealloc
+      # GORM 模型文件中的 struct tag 本质较长（column/type/index/comment 等），
+      # 拆分会破坏可读性，因此豁免 lll 检查。
+      - path: biz/models/.*\.go
+        linters:
+          - lll
+
+formatters:
+  enable:
+    - goimports # Checks if the code and import statements are formatted according to the 'goimports' command.
+    - golines # Checks if code is formatted, and fixes long lines.
+  settings:
+    gofmt:
+      simplify: false
+      rewrite-rules:
+        - pattern: interface{}
+          replacement: any
+        - pattern: a[b:len(a)]
+          replacement: a[b:]
+    golines:
+      # 与 linters.settings.lll 的 line-length 保持一致，避免两套行宽标准冲突
+      max-len: 120
+
+run:
+  timeout: 5m
+  allow-parallel-runners: true
+  allow-serial-runners: true

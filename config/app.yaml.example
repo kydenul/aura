@@ -1,0 +1,73 @@
+# Aura 应用配置文件
+# 使用方式：复制本文件为 config/app.yaml，按实际环境填写值。
+# 支持 ${ENV_VAR} 语法引用系统环境变量（适用于 CI/CD 和容器部署）。
+#
+# 多环境：通过 APP_ENV 选择配置文件，优先 config/app.${APP_ENV}.yaml，
+# 不存在时回退到 config/app.yaml。文件修改后自动热更新，无需重启。
+
+# ── 服务监听 ──────────────────────────────────────────────────────────────────
+server:
+  grpc_addr: ":5568"                 # gRPC 原生端口（内部服务间调用 / 高性能客户端）
+  http_addr: ":8080"                 # HTTP REST 网关端口（前端 / 第三方 / Postman）
+  read_header_timeout_secs: 10       # 读请求头超时，防 Slowloris 慢速攻击
+  shutdown_timeout_secs: 10          # 优雅关闭等待超时
+
+  # HTTP CORS 策略（仅影响 http_addr）。
+  # 生产环境请显式收敛 allowed_origins，不要保留默认的 "*"。
+  # 注意：CORS 规范禁止 allowed_origins=["*"] 与 allow_credentials=true 同时使用，
+  # 启动时会 fail-fast 拒绝这种组合。
+  cors:
+    allowed_origins: ["*"]
+    allowed_methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"]
+    allowed_headers: ["Content-Type", "Authorization"]
+    allow_credentials: false
+
+# ── JWT ───────────────────────────────────────────────────────────────────────
+jwt:
+  # 生产环境务必通过环境变量注入，不要硬编码：
+  # HS256 推荐使用至少 32 字节（256 bit）的强随机密钥，否则启动时会打印告警。
+  secret: "${JWT_SECRET}"
+  issuer: "aura"
+  ttl_hours: 2                       # token 有效期（小时）
+
+# ── 日志 ──────────────────────────────────────────────────────────────────────
+log:
+  level: "info"                      # debug | info | warn | error
+  format: "text"                     # text | json
+
+# ── 数据库 ────────────────────────────────────────────────────────────────────
+database:
+  dsn: "${DATABASE_DSN}"
+  max_open_conns: 50
+  max_idle_conns: 10
+  conn_max_lifetime_secs: 1800
+
+# ── Redis ─────────────────────────────────────────────────────────────────────
+redis:
+  host: "127.0.0.1"
+  port: 6379
+  password: "${REDIS_PASSWORD}"
+  db: 0
+  pool_size: 10
+  min_idle_conns: 2
+  dial_timeout_secs: 5
+  read_timeout_secs: 3
+  write_timeout_secs: 3
+  max_retries: 2
+
+# ── 可观测性 ──────────────────────────────────────────────────────────────────
+# metrics / health / pprof 统一挂在独立运维端口 admin_addr 上，与业务端口隔离，
+# 仅在内网/受信网络暴露，切勿对公网开放。
+observability:
+  admin_addr: ":9090"                # 运维端口：承载 /metrics、/healthz、/readyz、/debug/pprof
+  metrics:
+    enabled: true                    # 暴露 Prometheus 拉取端点
+    path: "/metrics"
+  tracing:
+    enabled: true                    # 关闭后日志将不再带 trace_id
+    exporter: "none"                 # none（仅进程内，不上报）| otlp（上报到 collector）
+    endpoint: "localhost:4317"       # exporter=otlp 时的 OTLP gRPC collector 地址
+    insecure: true                   # 内网 collector 明文连接；生产建议 TLS
+    sample_ratio: 1.0                # [0,1] 采样比例；高流量可调小（trace_id 仍始终生成）
+  pprof:
+    enabled: false                   # 性能剖析端点，默认关闭，仅排障时临时开启
