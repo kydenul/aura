@@ -53,7 +53,7 @@ func main() {
 
 	// ---------- 2. 初始化日志 ----------
 	// 统一日志组件（基于 zap）；OnReload 回调让日志级别改 yaml 后立即生效，无需重启。
-	if err := log.Init(log.Config{
+	logCfg := log.Config{
 		Level:  cfg.Log.Level,
 		Format: cfg.Log.Format,
 		Output: cfg.Log.Output,
@@ -64,7 +64,8 @@ func main() {
 			MaxAgeDays: cfg.Log.File.MaxAgeDays,
 			Compress:   cfg.Log.File.Compress,
 		},
-	}); err != nil {
+	}
+	if err := log.Init(logCfg); err != nil {
 		log.Fatalf("failed to init logger: %v", err)
 	}
 	config.OnReload(func() {

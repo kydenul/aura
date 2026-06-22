@@ -39,3 +39,8 @@ gen/
 
 # Third party
 third_party/
+
+# log
+log/
+logs/
+*.log

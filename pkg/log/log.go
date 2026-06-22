@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 
@@ -120,6 +121,16 @@ func Init(cfg Config) error {
 	atomicLevel.SetLevel(lvl)
 	l, closer := build(cfg, atomicLevel)
 	store(l, closer)
+
+	// 启动期打印日志落点：写文件时给出绝对路径（相对路径已按 cwd 解析），
+	// 仅 stdout 时显式提示未写文件，避免「找不到日志文件」的困惑。
+	p, _ := resolveFileOutput(cfg)
+	if p != "" {
+		l.Info("📁 日志文件: " + p)
+	} else {
+		l.Info("📑 日志仅输出到 stdout，未写入文件")
+	}
+
 	return nil
 }
 
@@ -174,17 +185,18 @@ func build(cfg Config, lvl zap.AtomicLevel) (*zap.Logger, io.Closer) {
 //   - file / both：经 lumberjack 写文件，单文件超阈值自动切割并按个数/天数清理；
 //   - 其余（含非法值或文件路径为空）：退化为仅 stdout，保证日志永不丢失。
 func buildWriteSyncer(cfg Config) (zapcore.WriteSyncer, io.Closer) {
-	wantFile := strings.EqualFold(cfg.Output, OutputFile) || strings.EqualFold(cfg.Output, OutputBoth)
-	if !wantFile || strings.TrimSpace(cfg.File.Path) == "" {
+	path, ok := resolveFileOutput(cfg)
+	if !ok {
 		return zapcore.Lock(os.Stdout), nil
 	}
 
 	lj := &lumberjack.Logger{
-		Filename:   cfg.File.Path,
+		Filename:   path,
 		MaxSize:    cfg.File.MaxSizeMB,
 		MaxBackups: cfg.File.MaxBackups,
 		MaxAge:     cfg.File.MaxAgeDays,
 		Compress:   cfg.File.Compress,
+		LocalTime:  true,
 	}
 
 	if strings.EqualFold(cfg.Output, OutputBoth) {
@@ -192,6 +204,23 @@ func buildWriteSyncer(cfg Config) (zapcore.WriteSyncer, io.Closer) {
 		return ws, lj
 	}
 	return zapcore.AddSync(lj), lj
+}
+
+// resolveFileOutput 判定给定配置下是否启用文件输出，并返回最终落盘的绝对路径。
+// 仅当 output 含 file / both 且 path 非空时启用；相对路径按进程当前工作目录（cwd）
+// 解析为绝对路径，使「实际写入位置」与「启动期打印的路径」严格一致，避免因启动目录
+// 不同而找不到文件。Abs 失败（极少见）时退回原始路径，保证不影响写入。
+func resolveFileOutput(cfg Config) (string, bool) {
+	wantFile := strings.EqualFold(cfg.Output, OutputFile) || strings.EqualFold(cfg.Output, OutputBoth)
+	p := strings.TrimSpace(cfg.File.Path)
+	if !wantFile || p == "" {
+		return "", false
+	}
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return p, true
+	}
+	return abs, true
 }
 
 // store 原子替换全局 logger 及其衍生实例，并关闭被替换掉的旧文件句柄。
